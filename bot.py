@@ -6,11 +6,11 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
 from typing import List, Dict, Optional, Tuple
 import re
 from dateutil import parser as date_parser
-from zoneinfo import ZoneInfo  # для расписания по Мск
+from zoneinfo import ZoneInfo
 
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -24,6 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("news-monitor-bot")
 
+
 # -------------------- Per-domain rules --------------------
 DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "spot.ai":     {"allow": ("/blog",), "ban": ("/pricing", "/careers", "/docs", "/documentation", "/solutions", "/product", "/products")},
@@ -31,14 +32,15 @@ DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "irisity.com": {"allow": ("/news", "/blog"), "ban": ()},
 }
 
-# Общие разрешённые/запрещённые фрагменты путей
 DEFAULT_ALLOWED = ("/blog", "/news", "/press", "/press-releases", "/newsroom", "/articles", "/story", "/stories", "/updates")
 DEFAULT_BANNED  = ("/solutions", "/solution", "/product", "/products", "/pricing", "/careers", "/docs", "/documentation")
 
+
 # ----------------------- HTTP headers ----------------------
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.4)'
+    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.5)'
 }
+
 
 # ----------------------- Category i18n ----------------------
 CAT_RU = {
@@ -54,6 +56,7 @@ CAT_EMOJI = {
     "other": "🏷️",
 }
 
+
 # ========================= BOT ============================
 class NewsMonitorBot:
     def __init__(self, token: str):
@@ -66,7 +69,7 @@ class NewsMonitorBot:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
-        # Sources
+        # Источники
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +86,7 @@ class NewsMonitorBot:
             )
         ''')
 
-        # Cached items (для дедупликации)
+        # Кэш новостей (для дедупликации)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS item_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +101,7 @@ class NewsMonitorBot:
             )
         ''')
 
-        # Favourites (на будущее)
+        # Избранное (на будущее)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS favourites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,9 +127,8 @@ class NewsMonitorBot:
 
     def normalize_url(self, url: str) -> Tuple[str, str]:
         """
-        Normalize URL and extract domain.
-        - Если введён просто домен → вернём корень (scheme://host)
-        - Если введён путь и он похож на раздел новостей (blog/news/press/...) → сохраним этот раздел
+        Приводим URL к виду scheme://host и, если путь указывает на блог/новости,
+        оставляем корень соответствующего раздела.
         """
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -264,7 +266,7 @@ class NewsMonitorBot:
         await update.message.reply_text(f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN)
 
     async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать избранные (если пользователь их добавлял внешней командой /fav — не в списке)."""
+        """Показать избранные (если когда-то будут добавляться внешней командой)."""
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
@@ -291,7 +293,7 @@ class NewsMonitorBot:
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-    # --- Команды категорий: возвращаем только выбранную категорию одним сообщением ---
+    # --- Команды категорий: только выбранная категория ---
     async def event_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "event")
 
@@ -305,7 +307,7 @@ class NewsMonitorBot:
         await self._send_category_list(update, "other")
 
     async def _send_category_list(self, update: Update, category: str, limit: int = 10):
-        """Собираем все закешированные материалы пользователя, переклассифицируем и фильтруем по категории."""
+        """Берём из кэша пользователя, переклассифицируем и фильтруем строго по категории."""
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
@@ -320,7 +322,6 @@ class NewsMonitorBot:
         rows = cursor.fetchall()
         conn.close()
 
-        # Переклассифицируем на лету
         items = []
         for title, link, pub_date in rows:
             try:
@@ -379,7 +380,7 @@ class NewsMonitorBot:
         await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
     async def _post_init(self, app: Application):
-        """Обновляем список команд в меню клиента Telegram (без /menu, /menu_off, /test)."""
+        """Меню команд Telegram (без /menu, /menu_off, /test)."""
         commands = [
             BotCommand("start", "Запустить бота"),
             BotCommand("list", "Список доменов"),
@@ -432,7 +433,7 @@ class NewsMonitorBot:
                             INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
                             VALUES (?, ?, ?, ?, ?)
                         ''', (source_id, item['id'], item['title'], item['link'], item['date']))
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.4)
 
                 cursor.execute("UPDATE sources SET last_check = ? WHERE id = ?", (datetime.now(), source_id))
 
@@ -490,7 +491,7 @@ class NewsMonitorBot:
                 except Exception:
                     continue
 
-            # 2) Common RSS paths
+            # 2) Общие RSS-пути
             common_paths = [
                 '/blog/feed', '/blog/rss', '/blog/feed.xml', '/blog/atom.xml', '/blog/index.xml',
                 '/news/feed', '/news/rss', '/news/feed.xml', '/news/atom.xml', '/news/index.xml',
@@ -503,7 +504,7 @@ class NewsMonitorBot:
                     if await self.verify_feed(fu):
                         return fu, 'rss'
 
-            # 3) HTML news sections (validate)
+            # 3) HTML разделы с новостями
             news_paths = ['/blog', '/news', '/press', '/press-releases', '/newsroom', '/articles', '/stories', '/story', '/updates']
             banned_paths = list(DEFAULT_BANNED)
 
@@ -514,7 +515,6 @@ class NewsMonitorBot:
                     return False
                 return any(path == np or path.startswith(np + '/') for np in news_paths)
 
-            # Сначала /blog, потом остальные
             ordered_candidates = []
             for base in candidate_bases:
                 ordered_candidates.append(urljoin(base, '/blog'))
@@ -544,7 +544,7 @@ class NewsMonitorBot:
                 except Exception:
                     continue
 
-            # 4) Fallback: root как HTML
+            # 4) Fallback: корень как HTML
             try:
                 r = requests.get(root, timeout=10, headers=DEFAULT_HEADERS)
                 if r.status_code == 200:
@@ -578,16 +578,19 @@ class NewsMonitorBot:
             return None
 
     def parse_pub_date(self, item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str) -> datetime:
-        # 1) <time> tag
+        """Дата из карточки/листинга."""
+        # 1) <time>
         time_tag = item_soup.find('time')
         if time_tag:
             if time_tag.has_attr('datetime'):
                 dt = self._try_parse_date_text(time_tag['datetime'])
-                if dt: return dt
+                if dt:
+                    return dt
             dt = self._try_parse_date_text(time_tag.get_text(" ", strip=True))
-            if dt: return dt
+            if dt:
+                return dt
 
-        # 2) meta tags on listing page
+        # 2) meta на странице листинга
         meta_names = [
             ("meta", {"property": "article:published_time"}),
             ("meta", {"name": "article:published_time"}),
@@ -601,15 +604,17 @@ class NewsMonitorBot:
             m = page_soup.find(tag, attrs=attrs)
             if m and m.has_attr('content'):
                 dt = self._try_parse_date_text(m['content'])
-                if dt: return dt
+                if dt:
+                    return dt
 
-        # 3) common classes
+        # 3) типичные классы
         cand = item_soup.select_one('.date, .post-date, .published, .posted-on, .entry-date, [class*="date"], [class*="time"]')
         if cand:
             dt = self._try_parse_date_text(cand.get_text(" ", strip=True))
-            if dt: return dt
+            if dt:
+                return dt
 
-        # 4) date in URL
+        # 4) дата в URL /YYYY/MM/DD/
         if link:
             m = re.search(r'/(\d{4})/(\d{2})/(\d{2})(?:/|$)', link)
             if m:
@@ -619,6 +624,7 @@ class NewsMonitorBot:
                 except Exception:
                     pass
 
+        # 5) фолбэк
         return datetime.now()
 
     async def extract_date_from_article_page(self, article_url: str) -> datetime:
@@ -630,7 +636,7 @@ class NewsMonitorBot:
 
             soup = BeautifulSoup(response.content, 'html.parser')
 
-            # 1) meta tags
+            # 1) meta
             meta_selectors = [
                 'meta[property="article:published_time"]',
                 'meta[name="article:published_time"]',
@@ -686,7 +692,7 @@ class NewsMonitorBot:
                 except Exception:
                     continue
 
-            # 4) Patterns
+            # 4) Паттерны
             text = soup.get_text(" ", strip=True)
             patterns = [
                 r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b',
@@ -707,36 +713,52 @@ class NewsMonitorBot:
 
         return datetime.now()
 
-    # ------------------ Categorization ------------------
+    # ------------------ Categorization (improved) ------------------
+    # URL-эвристики
+    URL_EVENT_HOSTS  = re.compile(r'(eventbrite|addevent|lu\.ma|hopin|airmeet|tito\.io|meetup\.com)', re.I)
+    URL_EVENT_PATHS  = re.compile(r'/(events?|webinars?|livestreams?)(/|$)', re.I)
+    URL_CASE_PATHS   = re.compile(r'/(case-?stud(y|ies)|customers?|customer-?stories|success-?stories|use-?cases?)(/|$)', re.I)
+    URL_PRODUCT_PATH = re.compile(r'/(releases?|changelog|product-?updates?)(/|$)', re.I)
+
     CATEGORY_PATTERNS = {
         "event": re.compile(
-            r"\b(webinar|conference|summit|expo|keynote|workshop|meetup|session|panel|talk|booth|roadshow|roundtable|hackathon|agenda|register|join us)\b",
+            r"\b(webinar|live\s?stream|livestream|conference|summit|expo|keynote|workshop|meetup|session|panel|talk|booth|roadshow|roundtable|hackathon|agenda|register|rsvp|save\s+the\s+date|join\s+us)\b",
             re.I,
         ),
         "product": re.compile(
-            r"\b(release|launche?s?|update|updated|feature|ga\b|beta\b|preview|sdk|api|integration|now available|introduc|announc|version|v\d+(\.\d+)*)\b",
+            r"\b(release|launche?s?|update|updated|feature|ga\b|beta\b|preview|sdk|api|integration|now\s+available|introduc|announc|version|v\d+(\.\d+)*)\b",
             re.I,
         ),
         "cases": re.compile(
-            r"\b(case study|customer|client|success story|deployment|implementation|rollout|adopts|chooses|selects|uses)\b",
+            r"\b(case\s?study|customer\s?story|success\s?story|deployment|implementation|rollout|uses\b|adopts|chooses|selects|with\s+[A-Z][A-Za-z0-9&.\- ]+|at\s+[A-Z][A-Za-z0-9&.\- ]+)\b",
             re.I,
         ),
     }
 
     def classify_news(self, title: str, link: str = "", tags: Optional[List[str]] = None, summary: str = "") -> str:
-        """Возвращает 'event' | 'product' | 'cases' | 'other'."""
-        blob = " ".join([
-            title or "",
-            link or "",
-            " ".join(tags or []),
-            (summary or "")
-        ])
-        if self.CATEGORY_PATTERNS["event"].search(blob):
+        """
+        Возвращает 'event' | 'product' | 'cases' | 'other'.
+        Приоритет: URL-эвристики, затем ключевые слова (event > cases > product).
+        """
+        text_blob = " ".join([title or "", " ".join(tags or []), summary or ""])
+        link_l = (link or "").lower()
+
+        # URL-сигналы
+        if self.URL_EVENT_HOSTS.search(link_l) or self.URL_EVENT_PATHS.search(link_l):
             return "event"
-        if self.CATEGORY_PATTERNS["product"].search(blob):
-            return "product"
-        if self.CATEGORY_PATTERNS["cases"].search(blob):
+        if self.URL_CASE_PATHS.search(link_l):
             return "cases"
+        if self.URL_PRODUCT_PATH.search(link_l):
+            return "product"
+
+        # По тексту
+        if self.CATEGORY_PATTERNS["event"].search(text_blob):
+            return "event"
+        if self.CATEGORY_PATTERNS["cases"].search(text_blob):
+            return "cases"
+        if self.CATEGORY_PATTERNS["product"].search(text_blob):
+            return "product"
+
         return "other"
 
     # ------------------ Fetch items ------------------
@@ -817,7 +839,7 @@ class NewsMonitorBot:
                             logger.debug(f"Selector error {selector}: {e}")
                             continue
 
-                # 2) план С: все ссылки вида /blog/... и т.п.
+                # 2) план C: все ссылки вида /blog/... и т.п.
                 if len(found_items) < 3:
                     seen_links = set()
                     for soup in soups:
@@ -915,7 +937,7 @@ class NewsMonitorBot:
                 soup = BeautifulSoup(r.content, 'html.parser')
                 soups.append(soup)
 
-                # пытаемся найти next
+                # ищем next
                 next_link = None
                 link_tag = soup.find('link', rel=lambda v: v and 'next' in v.lower())
                 if link_tag and link_tag.get('href'):
@@ -953,6 +975,7 @@ class NewsMonitorBot:
         return soups
 
     def parse_publication_date(self, entry) -> datetime:
+        """Дата для RSS/Atom entry."""
         date_fields = ['published_parsed', 'updated_parsed', 'created_parsed']
         for field in date_fields:
             if hasattr(entry, field) and getattr(entry, field):
@@ -974,6 +997,7 @@ class NewsMonitorBot:
         return datetime.now()
 
     def format_news_item(self, item: Dict) -> str:
+        """Формат карточки новости для сообщений списка/initial."""
         pub_date = item['date']
         now = datetime.now()
         days_diff = (now.date() - pub_date.date()).days
@@ -1053,13 +1077,13 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("remove", self.remove_source))
         app.add_handler(CommandHandler("favourites", self.favourites))
 
-        # Категории (строго одна категория в ответе)
-        app.add_handler(CommandHandler("event", self.event_cmd))
+        # Категории: строго одна категория, добавлены синонимы
+        app.add_handler(CommandHandler(["event", "events"], self.event_cmd))
+        app.add_handler(CommandHandler(["cases", "case"], self.cases_cmd))
         app.add_handler(CommandHandler("product", self.product_cmd))
-        app.add_handler(CommandHandler("cases", self.cases_cmd))
         app.add_handler(CommandHandler("other", self.other_cmd))
 
-        # Поставим команды в меню клиента Telegram
+        # Команды в меню Telegram
         app.post_init = self._post_init
 
         # ⏰ ЕЖЕДНЕВНЫЙ ЗАПУСК В 12:00 ПО МОСКВЕ
@@ -1068,7 +1092,7 @@ class NewsMonitorBot:
             msk = ZoneInfo("Europe/Moscow")
             job_queue.run_daily(
                 self.periodic_check,
-                time=time(hour=12, minute=0, tzinfo=msk),
+                time=dt_time(hour=12, minute=0, tzinfo=msk),
                 name="daily_news_check_moscow_noon",
             )
             logger.info("Scheduled daily check at 12:00 Europe/Moscow")
@@ -1084,7 +1108,7 @@ class NewsMonitorBot:
 
 # ======================== MAIN ===========================
 if __name__ == '__main__':
-    # Рекомендуется хранить токен в переменной окружения BOT_TOKEN
+    # Токен лучше хранить в переменной окружения BOT_TOKEN или TELEGRAM_BOT_TOKEN
     BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
     bot = NewsMonitorBot(BOT_TOKEN)
     bot.run()
