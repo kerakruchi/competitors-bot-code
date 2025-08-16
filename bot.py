@@ -25,8 +25,8 @@ logger = logging.getLogger("news-monitor-bot")
 # -------------------- Per-domain rules --------------------
 # Можно дополнять по мере необходимости
 DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    "spot.ai":   {"allow": ("/blog",), "ban": ("/pricing", "/careers", "/docs", "/documentation", "/solutions", "/product", "/products")},
-    "lumana.ai": {"allow": ("/blog", "/news"), "ban": ("/solutions", "/solution", "/product", "/products", "/pricing", "/careers")},
+    "spot.ai":     {"allow": ("/blog",), "ban": ("/pricing", "/careers", "/docs", "/documentation", "/solutions", "/product", "/products")},
+    "lumana.ai":   {"allow": ("/blog", "/news"), "ban": ("/solutions", "/solution", "/product", "/products", "/pricing", "/careers")},
     "irisity.com": {"allow": ("/news", "/blog"), "ban": ()},
 }
 
@@ -36,7 +36,7 @@ DEFAULT_BANNED  = ("/solutions", "/solution", "/product", "/products", "/pricing
 
 # ----------------------- HTTP headers ----------------------
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.2; +https://example.com/bot)'
+    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.2)'
 }
 
 # ========================= BOT ============================
@@ -623,6 +623,41 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
         return datetime.now()
 
+    # ------------------ Categorization ------------------
+    CATEGORY_PATTERNS = {
+        "event": re.compile(
+            r"\b(webinar|conference|summit|expo|keynote|workshop|meetup|session|panel|talk|booth|roadshow|roundtable|hackathon|agenda|register|join us)\b",
+            re.I,
+        ),
+        "product": re.compile(
+            r"\b(release|launche?s?|update|updated|feature|ga\b|beta\b|preview|sdk|api|integration|now available|introduc|announc|version|v\d+(\.\d+)*)\b",
+            re.I,
+        ),
+        "cases": re.compile(
+            r"\b(case study|customer|client|success story|deployment|implementation|rollout|adopts|chooses|selects|uses)\b",
+            re.I,
+        ),
+    }
+
+    def classify_news(self, title: str, link: str = "", tags: Optional[List[str]] = None, summary: str = "") -> str:
+        """
+        Возвращает один из: 'event' | 'product' | 'cases' | 'other'
+        Смотрим на заголовок + URL + теги/категории из RSS + краткое описание.
+        """
+        blob = " ".join([
+            title or "",
+            link or "",
+            " ".join(tags or []),
+            (summary or "")
+        ])
+        if self.CATEGORY_PATTERNS["event"].search(blob):
+            return "event"
+        if self.CATEGORY_PATTERNS["product"].search(blob):
+            return "product"
+        if self.CATEGORY_PATTERNS["cases"].search(blob):
+            return "cases"
+        return "other"
+
     # ------------------ Fetch items ------------------
     async def fetch_items(self, feed_url: str, feed_type: str) -> List[Dict]:
         items: List[Dict] = []
@@ -634,12 +669,30 @@ I check for updates every 20 minutes and will send you new items as soon as they
                 feed = feedparser.parse(response.content)
                 for entry in feed.entries:
                     pub_date = self.parse_publication_date(entry)
+
+                    # Теги/summary для лучшей категоризации
+                    rss_tags: List[str] = []
+                    if hasattr(entry, "tags") and entry.tags:
+                        for t in entry.tags:
+                            term = (t.get("term") if isinstance(t, dict) else getattr(t, "term", None))
+                            if term:
+                                rss_tags.append(str(term))
+                    summary = entry.get("summary", "") or entry.get("description", "")
+
+                    category = self.classify_news(
+                        entry.get("title", ""),
+                        entry.get("link", ""),
+                        rss_tags,
+                        summary,
+                    )
+
                     item_id = entry.get('id', entry.get('link', '')) or f"{entry.get('title', '')}_{pub_date.isoformat()}"
                     items.append({
                         'id': item_id,
                         'title': entry.get('title', 'No title'),
                         'link': entry.get('link', ''),
-                        'date': pub_date
+                        'date': pub_date,
+                        'category': category,
                     })
 
             elif feed_type == 'html':
@@ -678,7 +731,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
                                     valid_articles.append((elem, soup))
                             if len(valid_articles) >= 2:
                                 found_items.extend(valid_articles)
-                                break  # достаточно по этому селектору
+                                break
                         except Exception as e:
                             logger.debug(f"Selector error {selector}: {e}")
                             continue
@@ -699,7 +752,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
                                 not any(path_lower == bf or path_lower.startswith(bf + '/') for bf in banned_fragments) and
                                 not any(sk in href.lower() for sk in ['mailto:', 'tel:', '#', 'javascript:'])
                             ):
-                                # создаём псевдокарточку: возьмём ближайший контейнер
                                 container = a
                                 for _ in range(3):
                                     if container.parent:
@@ -712,7 +764,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
                 added = set()
                 for item_node, page_soup in found_items:
                     try:
-                        # Ссылка
                         a = item_node.find('a', href=True)
                         if not a:
                             continue
@@ -722,7 +773,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
                         if 'mailto:' in link or 'tel:' in link or link.endswith('#'):
                             continue
 
-                        # Заголовок
                         title_elem = item_node.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
                         title = ''
                         if title_elem:
@@ -733,22 +783,23 @@ I check for updates every 20 minutes and will send you new items as soon as they
                         if len(title) < 5:
                             continue
 
-                        # Предварительная дата
+                        # Предварительная дата + точное уточнение
                         pub_date = self.parse_pub_date(item_node, page_soup, link)
-                        # Точное уточнение (JSON-LD/мета/<time>)
                         precise = await self.extract_date_from_article_page(link)
                         if precise:
                             pub_date = precise
+
+                        category = self.classify_news(title, link)
 
                         items.append({
                             'id': link,
                             'title': title[:200],
                             'link': link,
-                            'date': pub_date
+                            'date': pub_date,
+                            'category': category,
                         })
                         added.add(link)
 
-                        # ограничим общее число собранных, чтобы не спамить
                         if len(items) >= 40:
                             break
                     except Exception as e:
@@ -773,7 +824,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
         visited = set()
         current = start_url
 
-        for i in range(max_pages):
+        for _ in range(max_pages):
             if not current or current in visited:
                 break
             visited.add(current)
@@ -811,7 +862,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
                         else:
                             next_link = current.rstrip('/') + '/page/2'
 
-                # останавливаемся, если next ведёт на другой домен или выглядит подозрительно
                 if urlparse(next_link).netloc and (self.get_domain_from_url(next_link) != self.get_domain_from_url(start_url)):
                     break
 
@@ -861,7 +911,10 @@ I check for updates every 20 minutes and will send you new items as soon as they
         if len(title) > 120:
             title = title[:117] + "..."
 
-        return f"📰 *{title}*\n📅 {date_str}\n🔗 {item['link']}\n"
+        tag = (item.get('category') or 'other').lower()
+        tag_emoji = {'event': '🎪', 'product': '🧩', 'cases': '📘', 'other': '🏷️'}.get(tag, '🏷️')
+
+        return f"{tag_emoji} *{title}*\n📅 {date_str}\n🏷️ {tag}\n🔗 {item['link']}\n"
 
     # ------------------ Initial send ------------------
     async def send_initial_items(self, update: Update, source_id: int):
@@ -933,7 +986,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
 # ======================== MAIN ===========================
 if __name__ == '__main__':
-    # Рекомендуется хранить токен в переменной окружения BOT_TOKEN
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+    # Читаем из BOT_TOKEN или TELEGRAM_BOT_TOKEN (оба варианта поддержаны)
+    BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
     bot = NewsMonitorBot(BOT_TOKEN)
     bot.run()
