@@ -227,11 +227,14 @@ class NewsMonitorBot:
             items.sort(key=lambda x: x['date'], reverse=True)
             recent_items = items[:3]
             
-            await update.message.reply_text(f"📰 *Latest 3 items from {domain}:*", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"📰 *Latest {len(recent_items)} items from {domain}:*\n_Found {len(items)} total articles_", 
+                parse_mode=ParseMode.MARKDOWN
+            )
             
             # Send items and cache them
             for i, item in enumerate(recent_items, 1):
-                message = f"*{i}/3* {self.format_news_item(item)}"
+                message = f"*{i}/{len(recent_items)}*\n{self.format_news_item(item)}"
                 await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
                 
                 # Cache item
@@ -239,6 +242,8 @@ class NewsMonitorBot:
                     INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
                     VALUES (?, ?, ?, ?, ?)
                 ''', (source_id, item['id'], item['title'], item['link'], item['date']))
+                
+                await asyncio.sleep(0.5)  # Small delay between messages
             
             # Mark as first sent
             cursor.execute("UPDATE sources SET first_sent = TRUE, last_check = ? WHERE id = ?", 
@@ -258,24 +263,15 @@ class NewsMonitorBot:
             if feed_type in ['rss', 'atom']:
                 # Parse RSS/Atom feed
                 response = requests.get(feed_url, timeout=15, headers={
-                    'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0)'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
                 response.raise_for_status()
                 
                 feed = feedparser.parse(response.content)
                 
                 for entry in feed.entries:
-                    # Parse date
-                    pub_date = datetime.now()
-                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        pub_date = datetime(*entry.published_parsed[:6])
-                    elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                        pub_date = datetime(*entry.updated_parsed[:6])
-                    elif hasattr(entry, 'published'):
-                        try:
-                            pub_date = date_parser.parse(entry.published, ignoretz=True)
-                        except:
-                            pass
+                    # Parse date with better handling
+                    pub_date = self.parse_publication_date(entry)
                     
                     item_id = entry.get('id', entry.get('link', ''))
                     if not item_id:
@@ -289,7 +285,7 @@ class NewsMonitorBot:
                     })
                     
             elif feed_type == 'html':
-                # Parse HTML news page
+                # Enhanced HTML parsing
                 response = requests.get(feed_url, timeout=15, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
@@ -297,51 +293,202 @@ class NewsMonitorBot:
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Look for common news item patterns
-                selectors = [
+                # Enhanced selectors for finding articles
+                article_selectors = [
                     'article',
-                    '[class*="post"]',
-                    '[class*="news"]', 
-                    '[class*="article"]',
-                    '[class*="item"]'
+                    '.post', '.blog-post', '.news-item', '.article-item',
+                    '.entry', '.post-item', '.blog-item', '.news-post',
+                    '[class*="post"]', '[class*="article"]', '[class*="blog"]',
+                    '[class*="news"]', '[class*="entry"]', '[class*="item"]'
                 ]
                 
-                news_items = []
-                for selector in selectors:
-                    items_found = soup.select(selector)
-                    if items_found:
-                        news_items = items_found[:10]
-                        break
+                found_items = []
+                for selector in article_selectors:
+                    try:
+                        elements = soup.select(selector)
+                        if elements and len(elements) >= 3:  # Good selector if it finds multiple items
+                            found_items = elements[:20]  # Take up to 20 items
+                            break
+                    except:
+                        continue
                 
-                for item in news_items:
-                    # Find title
-                    title_elem = item.find(['h1', 'h2', 'h3', 'h4', 'h5'], string=True)
-                    if not title_elem:
-                        title_elem = item.find('a', string=True)
-                    
-                    # Find link
-                    link_elem = item.find('a', href=True)
-                    
-                    if title_elem and link_elem:
-                        title = title_elem.get_text().strip()[:200]  # Limit title length
-                        link = urljoin(feed_url, link_elem['href'])
+                # If no good selector found, try a more general approach
+                if not found_items:
+                    # Look for common container patterns
+                    containers = soup.find_all(['div', 'section'], class_=re.compile(r'blog|post|article|news|content|main', re.I))
+                    for container in containers:
+                        articles = container.find_all(['article', 'div', 'li'], limit=20)
+                        if len(articles) > 5:  # If we found a container with many items
+                            found_items = articles
+                            break
+                
+                logger.info(f"Found {len(found_items)} potential articles on HTML page")
+                
+                for item in found_items:
+                    try:
+                        # Enhanced title extraction
+                        title_elem = None
+                        title_selectors = [
+                            'h1', 'h2', 'h3', 'h4', 'h5', 
+                            '.title', '.headline', '.post-title', '.article-title',
+                            '[class*="title"]', '[class*="headline"]'
+                        ]
                         
-                        items.append({
-                            'id': link,
-                            'title': title,
-                            'link': link,
-                            'date': datetime.now()
-                        })
+                        for selector in title_selectors:
+                            title_elem = item.select_one(selector)
+                            if title_elem and title_elem.get_text(strip=True):
+                                break
+                        
+                        # Enhanced link extraction
+                        link_elem = item.find('a', href=True)
+                        if not link_elem:
+                            # Look for link in title
+                            if title_elem:
+                                link_elem = title_elem.find('a', href=True) or title_elem.find_parent('a', href=True)
+                        
+                        # Enhanced date extraction
+                        pub_date = self.extract_date_from_html(item)
+                        
+                        if title_elem and link_elem:
+                            title = title_elem.get_text().strip()
+                            # Clean up title
+                            title = re.sub(r'\s+', ' ', title)  # Remove extra whitespace
+                            title = title[:200] if len(title) > 200 else title  # Limit length
+                            
+                            if len(title) < 10:  # Skip very short titles
+                                continue
+                                
+                            link = urljoin(feed_url, link_elem['href'])
+                            
+                            # Skip duplicate links
+                            if any(existing['link'] == link for existing in items):
+                                continue
+                            
+                            items.append({
+                                'id': link,
+                                'title': title,
+                                'link': link,
+                                'date': pub_date
+                            })
+                            
+                    except Exception as e:
+                        logger.debug(f"Error parsing HTML item: {e}")
+                        continue
                         
         except Exception as e:
             logger.error(f"Error fetching items from {feed_url}: {e}")
             
+        logger.info(f"Successfully parsed {len(items)} items")
         return items
 
+    def parse_publication_date(self, entry) -> datetime:
+        """Enhanced date parsing for RSS/Atom entries"""
+        # Try different date fields in order of preference
+        date_fields = ['published_parsed', 'updated_parsed', 'created_parsed']
+        
+        for field in date_fields:
+            if hasattr(entry, field) and getattr(entry, field):
+                try:
+                    parsed_time = getattr(entry, field)
+                    return datetime(*parsed_time[:6])
+                except:
+                    continue
+        
+        # Try string date fields
+        string_fields = ['published', 'updated', 'created', 'pubDate']
+        
+        for field in string_fields:
+            if hasattr(entry, field) and getattr(entry, field):
+                try:
+                    date_str = getattr(entry, field)
+                    return date_parser.parse(date_str, ignoretz=True)
+                except:
+                    continue
+        
+        # Fallback to current time
+        return datetime.now()
+
+    def extract_date_from_html(self, item) -> datetime:
+        """Extract publication date from HTML article"""
+        # Look for date in various formats and locations
+        date_selectors = [
+            'time', '.date', '.published', '.post-date', '.article-date',
+            '[class*="date"]', '[class*="time"]', '[class*="published"]',
+            'meta[property="article:published_time"]',
+            'meta[name="published"]', 'meta[name="date"]'
+        ]
+        
+        for selector in date_selectors:
+            try:
+                date_elem = item.select_one(selector)
+                if date_elem:
+                    # Check for datetime attribute first
+                    if date_elem.get('datetime'):
+                        try:
+                            return date_parser.parse(date_elem['datetime'], ignoretz=True)
+                        except:
+                            pass
+                    
+                    # Check for content attribute (meta tags)
+                    if date_elem.get('content'):
+                        try:
+                            return date_parser.parse(date_elem['content'], ignoretz=True)
+                        except:
+                            pass
+                    
+                    # Parse text content
+                    date_text = date_elem.get_text(strip=True)
+                    if date_text:
+                        try:
+                            return date_parser.parse(date_text, ignoretz=True)
+                        except:
+                            pass
+            except:
+                continue
+        
+        # Look for date patterns in text
+        text_content = item.get_text()
+        date_patterns = [
+            r'\b(\w+\s+\d{1,2},\s+\d{4})\b',  # "January 15, 2024"
+            r'\b(\d{1,2}/\d{1,2}/\d{4})\b',    # "01/15/2024"
+            r'\b(\d{4}-\d{2}-\d{2})\b',        # "2024-01-15"
+            r'\b(\d{1,2}-\d{1,2}-\d{4})\b',    # "15-01-2024"
+        ]
+        
+        for pattern in date_patterns:
+            matches = re.search(pattern, text_content)
+            if matches:
+                try:
+                    return date_parser.parse(matches.group(1), ignoretz=True)
+                except:
+                    continue
+        
+        # Fallback to current time
+        return datetime.now()
+
     def format_news_item(self, item: Dict) -> str:
-        """Format news item for Telegram message"""
-        date_str = item['date'].strftime("%Y-%m-%d %H:%M")
-        title = item['title'][:150] + "..." if len(item['title']) > 150 else item['title']
+        """Enhanced formatting for news items with better date display"""
+        # Format date more nicely
+        pub_date = item['date']
+        
+        # Check if it's today, yesterday, or older
+        now = datetime.now()
+        days_diff = (now.date() - pub_date.date()).days
+        
+        if days_diff == 0:
+            date_str = f"Today {pub_date.strftime('%H:%M')}"
+        elif days_diff == 1:
+            date_str = f"Yesterday {pub_date.strftime('%H:%M')}"
+        elif days_diff < 7:
+            date_str = pub_date.strftime("%A %H:%M")  # "Monday 14:30"
+        else:
+            date_str = pub_date.strftime("%b %d, %Y %H:%M")  # "Jan 15, 2024 14:30"
+        
+        # Clean and limit title length
+        title = item['title']
+        if len(title) > 120:
+            title = title[:117] + "..."
+        
         return f"📰 *{title}*\n📅 {date_str}\n🔗 {item['link']}\n"
 
     async def list_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
