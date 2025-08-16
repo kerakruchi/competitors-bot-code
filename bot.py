@@ -11,7 +11,7 @@ from typing import List, Dict, Optional, Tuple
 import re
 from dateutil import parser as date_parser
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
@@ -36,7 +36,7 @@ DEFAULT_BANNED  = ("/solutions", "/solution", "/product", "/products", "/pricing
 
 # ----------------------- HTTP headers ----------------------
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.2)'
+    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.3)'
 }
 
 # ========================= BOT ============================
@@ -51,6 +51,7 @@ class NewsMonitorBot:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
+        # Sources
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +68,7 @@ class NewsMonitorBot:
             )
         ''')
 
+        # Items cache
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS item_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,11 +77,32 @@ class NewsMonitorBot:
                 title TEXT,
                 link TEXT,
                 pub_date TIMESTAMP,
+                category TEXT DEFAULT 'other',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (source_id) REFERENCES sources (id),
                 UNIQUE(source_id, item_id)
             )
         ''')
+
+        # Favourites (избранные источники)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS favourites (
+                user_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, source_id),
+                FOREIGN KEY (source_id) REFERENCES sources (id)
+            )
+        ''')
+
+        # Миграция: добавить колонку category в item_cache, если её нет
+        cursor.execute("PRAGMA table_info(item_cache)")
+        cols = [row[1].lower() for row in cursor.fetchall()]
+        if 'category' not in cols:
+            try:
+                cursor.execute("ALTER TABLE item_cache ADD COLUMN category TEXT DEFAULT 'other'")
+            except Exception as e:
+                logger.warning(f"ALTER TABLE item_cache ADD COLUMN category failed: {e}")
 
         conn.commit()
         conn.close()
@@ -114,6 +137,12 @@ class NewsMonitorBot:
             normalized_url = root
 
         return normalized_url, host
+
+    def _fragments_for_domain(self, domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        rules = DOMAIN_RULES.get(domain, {})
+        allow = rules.get("allow", DEFAULT_ALLOWED)
+        ban = rules.get("ban", DEFAULT_BANNED)
+        return allow, ban
 
     # ------------------ Commands ------------------
     async def add_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,25 +198,28 @@ class NewsMonitorBot:
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT domain, status, feed_type, last_check, created_at
-            FROM sources WHERE user_id = ?
-            ORDER BY created_at DESC
-        ''', (user_id,))
+            SELECT s.id, s.domain, s.status, s.feed_type, s.last_check,
+                   EXISTS(SELECT 1 FROM favourites f WHERE f.user_id = ? AND f.source_id = s.id) AS is_fav
+            FROM sources s
+            WHERE s.user_id = ?
+            ORDER BY s.created_at DESC
+        ''', (user_id, user_id))
         sources = cursor.fetchall()
         conn.close()
 
         if not sources:
             await update.message.reply_text(
-                "📭 No sources being monitored.\n\nUse `/add <url>` to start monitoring a website!",
+                "📭 Нет источников.\nДобавь сайт: `/add <url>`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
-        message = "📊 *Your Monitored Sources:*\n\n"
-        for i, (domain, status, feed_type, last_check, created_at) in enumerate(sources, 1):
+        message = "📊 *Твои домены:*\n\n"
+        for i, (sid, domain, status, feed_type, last_check, is_fav) in enumerate(sources, 1):
             status_emoji = "🟢" if status == "active" else "🔴"
+            star = "🧡 " if is_fav else ""
             last_check_str = "Never" if not last_check else datetime.fromisoformat(last_check).strftime("%m-%d %H:%M")
-            message += f"{i}. {status_emoji} *{domain}*\n"
+            message += f"{i}. {star}{status_emoji} *{domain}*\n"
             message += f"   📡 Type: {feed_type.upper()}\n"
             message += f"   🕒 Last check: {last_check_str}\n\n"
 
@@ -213,7 +245,7 @@ class NewsMonitorBot:
         result = cursor.fetchone()
         if not result:
             await update.message.reply_text(
-                f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.",
+                f"❌ Домен `{domain}` не найден в твоих источниках.\n\nИспользуй `/list` чтобы посмотреть список.",
                 parse_mode=ParseMode.MARKDOWN
             )
             conn.close()
@@ -221,111 +253,151 @@ class NewsMonitorBot:
 
         source_id = result[0]
         cursor.execute("DELETE FROM item_cache WHERE source_id = ?", (source_id,))
+        cursor.execute("DELETE FROM favourites WHERE source_id = ? AND user_id = ?", (source_id, user_id))
         cursor.execute("DELETE FROM sources WHERE id = ?", (source_id,))
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Удалён `{domain}`.", parse_mode=ParseMode.MARKDOWN)
 
-    async def test_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
+    async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать избранные домены пользователя."""
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT s.domain, s.feed_type, s.last_check
+            FROM favourites f
+            JOIN sources s ON s.id = f.source_id
+            WHERE f.user_id = ?
+            ORDER BY f.created_at DESC
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
             await update.message.reply_text(
-                "Usage: /test <domain>\n\nExample:\n`/test microsoft.com`",
+                "🧡 Пока нет избранных.\nДобавить: `/fav_add <domain>`\nУбрать: `/fav_remove <domain>`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
+        msg = "🧡 *Избранные домены:*\n\n"
+        for i, (domain, feed_type, last_check) in enumerate(rows, 1):
+            last_check_str = "Never" if not last_check else datetime.fromisoformat(last_check).strftime("%m-%d %H:%M")
+            msg += f"{i}. *{domain}* — {feed_type.upper()}, last check: {last_check_str}\n"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    # Скрытые команды для управления избранным
+    async def fav_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /fav_add <domain>")
+            return
+        user_id = update.effective_user.id
+        domain = context.args[0].lower().lstrip("@")
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
+        row = cursor.fetchone()
+        if not row:
+            await update.message.reply_text("❌ Сначала добавь домен через /add")
+            conn.close()
+            return
+        source_id = row[0]
+        try:
+            cursor.execute("INSERT OR IGNORE INTO favourites (user_id, source_id) VALUES (?, ?)", (user_id, source_id))
+            conn.commit()
+            await update.message.reply_text(f"🧡 `{domain}` добавлен в избранное.", parse_mode=ParseMode.MARKDOWN)
+        finally:
+            conn.close()
+
+    async def fav_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /fav_remove <domain>")
+            return
+        user_id = update.effective_user.id
         domain = context.args[0].lower()
         if domain.startswith('www.'):
             domain = domain[4:]
 
-        user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-
-        cursor.execute("SELECT feed_url, feed_type FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
-        result = cursor.fetchone()
-        conn.close()
-
-        if not result:
-            await update.message.reply_text(
-                f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.",
-                parse_mode=ParseMode.MARKDOWN
-            )
+        cursor.execute("SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
+        row = cursor.fetchone()
+        if not row:
+            await update.message.reply_text("❌ Домен не найден среди твоих источников.")
+            conn.close()
             return
-
-        feed_url, feed_type = result
-        await update.message.reply_text(f"🔍 Testing {domain}...")
-
-        try:
-            items = await self.fetch_items(feed_url, feed_type)
-            if items:
-                items.sort(key=lambda x: x['date'], reverse=True)
-                latest_item = items[0]
-                message = f"✅ *Test successful for {domain}*\n\n"
-                message += f"Latest item:\n{self.format_news_item(latest_item)}"
-                message += f"📊 Total items found: {len(items)}"
-                await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            else:
-                await update.message.reply_text(f"⚠️ No items found for {domain}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Test failed for {domain}: {str(e)}")
+        source_id = row[0]
+        cursor.execute("DELETE FROM favourites WHERE user_id = ? AND source_id = ?", (user_id, source_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"🗑️ `{domain}` удалён из избранного.", parse_mode=ParseMode.MARKDOWN)
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_message = """
-🤖 *Welcome to News Monitor Bot!*
+🤖 *Мониторинг конкурентов* запущен!
 
-I help you monitor company news feeds and get instant notifications when new content is published.
+*Команды:*
+- `/start` — запустить бота  
+- `/list` — список доменов  
+- `/add <url>` — добавить домен  
+- `/remove <domain>` — удалить домен  
+- `/favourites` — показать избранные  
+- `/events` — новости про ивенты  
+- `/product` — новости про продукты  
+- `/cases` — новости про кейсы  
+- `/other` — другие новости
 
-*📋 Commands:*
-- `/add <url>` - Add a company website to monitor
-- `/list` - Show all your monitored sources  
-- `/remove <domain>` - Remove a source from monitoring
-- `/test <domain>` - Test a source manually
-
-*🚀 How it works:*
-1. Add a company website with `/add <url>`
-2. I'll automatically find their RSS feed or news page
-3. You'll immediately get the 3 most recent news items
-4. I'll continuously monitor and notify you of new posts
-
-*🔔 Monitoring:*
-I check for updates every 20 minutes and will send you new items as soon as they appear!
+_Скрыто:_ `/fav_add <domain>` и `/fav_remove <domain>` — управление избранными доменами.
         """
         await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
-    # --------- Keyboard (menu) ----------
-    def _main_keyboard(self) -> ReplyKeyboardMarkup:
-        keyboard = [
-            ["/list", "/add"],
-            ["/test", "/remove"],
-            ["/menu_off"],
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    # ------------------ Category views ------------------
+    async def _send_category(self, update: Update, category: str, limit: int = 10):
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ic.title, ic.link, ic.pub_date, ic.category
+            FROM item_cache ic
+            JOIN sources s ON s.id = ic.source_id
+            WHERE s.user_id = ? AND lower(ic.category) = ?
+            ORDER BY ic.pub_date DESC
+            LIMIT ?
+        ''', (user_id, category.lower(), limit))
+        rows = cursor.fetchall()
+        conn.close()
 
-    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "📋 Выберите команду кнопкой ниже:",
-            reply_markup=self._main_keyboard()
-        )
+        if not rows:
+            await update.message.reply_text(f"📭 Пока нет новостей категории *{category}*.", parse_mode=ParseMode.MARKDOWN)
+            return
 
-    async def menu_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🧹 Клавиатура скрыта. Включить снова: /menu",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text(f"🏷️ *{category.capitalize()}* — последние {len(rows)}:", parse_mode=ParseMode.MARKDOWN)
+        for i, (title, link, pub_date, cat) in enumerate(rows, 1):
+            try:
+                dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+            except Exception:
+                dt = datetime.now()
+            item = {'title': title, 'link': link, 'date': dt, 'category': cat}
+            msg = f"*{i}/{len(rows)}*\n" + self.format_news_item(item)
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            await asyncio.sleep(0.2)
 
-    async def _post_init(self, app: Application):
-        commands = [
-            BotCommand("start", "Показать справку"),
-            BotCommand("menu", "Показать клавиатуру с командами"),
-            BotCommand("list", "Список источников"),
-            BotCommand("add", "Добавить источник: /add <url>"),
-            BotCommand("test", "Тест источника: /test <domain>"),
-            BotCommand("remove", "Удалить источник: /remove <domain>"),
-            BotCommand("menu_off", "Скрыть клавиатуру"),
-        ]
-        await app.bot.set_my_commands(commands)
+    async def events_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._send_category(update, "event")
+
+    async def product_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._send_category(update, "product")
+
+    async def cases_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._send_category(update, "cases")
+
+    async def other_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._send_category(update, "other")
 
     # ------------------ Scheduler ------------------
     async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
@@ -366,9 +438,9 @@ I check for updates every 20 minutes and will send you new items as soon as they
                                 disable_web_page_preview=True
                             )
                             cursor.execute('''
-                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (source_id, item['id'], item['title'], item['link'], item['date']))
+                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date, category)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            ''', (source_id, item['id'], item['title'], item['link'], item['date'], item.get('category', 'other')))
                             await asyncio.sleep(1)
                         except Exception as e:
                             logger.error(f"Error sending message to user {user_id}: {e}")
@@ -393,7 +465,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
             # Popular subdomains + root
             subdomains = [
-                'blog', 'news', 'press', 'newsroom', 'media', 'stories', 'source',
+                'blog', 'news', 'press', 'newsroom', 'media', 'stories',
                 'about', 'company', 'corporate', 'updates'
             ]
             candidate_bases = [root] + [f"{scheme}://{sd}.{host}" for sd in subdomains]
@@ -733,7 +805,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
                 allowed_fragments, banned_fragments = self._fragments_for_domain(self.get_domain_from_url(feed_url))
 
                 found_items = []
-                # 1) Сначала пробуем «карточки»
+                # 1) карточки
                 for soup in soups:
                     selectors = [
                         'article',
@@ -769,7 +841,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
                             logger.debug(f"Selector error {selector}: {e}")
                             continue
 
-                # 2) Если карточек мало — «план С»: собрать все ссылки /blog/… и т.п.
+                # 2) fallback — собрать ссылки
                 if len(found_items) < 3:
                     seen_links = set()
                     for soup in soups:
@@ -793,7 +865,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
                 logger.info(f"Processing {len(found_items)} potential articles from HTML pages")
 
-                # 3) Формирование items (всегда уточняем дату со страницы)
+                # 3) формирование items
                 added = set()
                 for item_node, page_soup in found_items:
                     try:
@@ -816,7 +888,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
                         if len(title) < 5:
                             continue
 
-                        # Предварительная дата + точное уточнение
                         pub_date = self.parse_pub_date(item_node, page_soup, link)
                         precise = await self.extract_date_from_article_page(link)
                         if precise:
@@ -845,12 +916,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
         logger.info(f"Successfully parsed {len(items)} items")
         return items
 
-    def _fragments_for_domain(self, domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        rules = DOMAIN_RULES.get(domain, {})
-        allow = rules.get("allow", DEFAULT_ALLOWED)
-        ban = rules.get("ban", DEFAULT_BANNED)
-        return allow, ban
-
     async def _fetch_list_pages_with_pagination(self, start_url: str, max_pages: int = 3) -> List[BeautifulSoup]:
         """Загружаем страницу списка + до 2 следующих (rel=next, /page/2, ?page=2 ...)"""
         soups: List[BeautifulSoup] = []
@@ -868,7 +933,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
                 soup = BeautifulSoup(r.content, 'html.parser')
                 soups.append(soup)
 
-                # пытаемся найти next
+                # найти next
                 next_link = None
                 link_tag = soup.find('link', rel=lambda v: v and 'next' in v.lower())
                 if link_tag and link_tag.get('href'):
@@ -880,7 +945,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
                         next_link = urljoin(current, a_next['href'])
 
                 if not next_link:
-                    # эвристики: /page/2, /page/3
+                    # /page/2
                     m = re.search(r'(.*?/page/)(\d+)/?$', current)
                     if m:
                         base, num = m.group(1), int(m.group(2))
@@ -980,9 +1045,9 @@ I check for updates every 20 minutes and will send you new items as soon as they
                 await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
                 cursor.execute('''
-                    INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (source_id, item['id'], item['title'], item['link'], item['date']))
+                    INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date, category)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (source_id, item['id'], item['title'], item['link'], item['date'], item.get('category', 'other')))
 
                 await asyncio.sleep(0.4)
 
@@ -995,19 +1060,42 @@ I check for updates every 20 minutes and will send you new items as soon as they
             logger.exception("Error sending initial items")
 
     # ------------------ Runner ------------------
+    async def _post_init(self, app: Application):
+        # Обновлённый список команд (только то, что ты просила)
+        commands = [
+            BotCommand("start", "Запустить бота"),
+            BotCommand("list", "Список доменов"),
+            BotCommand("add", "Добавить домен: /add url"),
+            BotCommand("remove", "Удалить домен: /remove url"),
+            BotCommand("favourites", "Показать избранные"),
+            BotCommand("events", "Новости про ивенты"),
+            BotCommand("product", "Новости про продукты"),
+            BotCommand("cases", "Новости про кейсы"),
+            BotCommand("other", "Другие новости"),
+        ]
+        await app.bot.set_my_commands(commands)
+
     def run(self):
         app = Application.builder().token(self.token).build()
 
         # Хендлеры команд
         app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("menu", self.menu))
-        app.add_handler(CommandHandler("menu_off", self.menu_off))
         app.add_handler(CommandHandler("add", self.add_source))
         app.add_handler(CommandHandler("list", self.list_sources))
         app.add_handler(CommandHandler("remove", self.remove_source))
-        app.add_handler(CommandHandler("test", self.test_source))
 
-        # Зарегистрировать Bot Menu при старте
+        # Новые хендлеры
+        app.add_handler(CommandHandler("favourites", self.favourites))
+        app.add_handler(CommandHandler("events", self.events_cmd))
+        app.add_handler(CommandHandler("product", self.product_cmd))
+        app.add_handler(CommandHandler("cases", self.cases_cmd))
+        app.add_handler(CommandHandler("other", self.other_cmd))
+
+        # Скрытые (не в списке команд)
+        app.add_handler(CommandHandler("fav_add", self.fav_add))
+        app.add_handler(CommandHandler("fav_remove", self.fav_remove))
+
+        # Регистрация Bot Menu
         app.post_init = self._post_init
 
         # Периодические проверки
@@ -1026,7 +1114,7 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
 # ======================== MAIN ===========================
 if __name__ == '__main__':
-    # Читаем из BOT_TOKEN или TELEGRAM_BOT_TOKEN (оба варианта поддержаны)
+    # Рекомендуется хранить токен в переменной окружения BOT_TOKEN
     BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
     bot = NewsMonitorBot(BOT_TOKEN)
     bot.run()
