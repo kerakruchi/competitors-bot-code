@@ -123,72 +123,123 @@ class NewsMonitorBot:
             await update.message.reply_text(f"❌ Error adding source: {str(e)}")
 
     def normalize_url(self, url: str) -> Tuple[str, str]:
-        """Normalize URL and extract domain"""
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+    """Normalize URL and extract domain.
+    - Если введён просто домен → вернём корень (scheme://host)
+    - Если введён путь и он похож на раздел новостей (blog/news/press/...) → сохраним этот раздел
+    """
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
 
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        if domain.startswith('www.'):
-            domain = domain[4:]
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith('www.'):
+        host = host[4:]
 
-        normalized_url = f"{parsed.scheme}://{parsed.netloc}"
-        return normalized_url, domain
+    root = f"{parsed.scheme}://{host}"
 
-    async def discover_feed(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Discover RSS/Atom feed from website"""
+    path = (parsed.path or '').strip('/')
+    news_roots = ('blog', 'news', 'press', 'newsroom', 'articles', 'media')
+    if path and path.split('/')[0].lower() in news_roots:
+        normalized_url = f"{root}/{path.split('/')[0]}"
+    else:
+        normalized_url = root
+
+    return normalized_url, host
+
+   async def discover_feed(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Discover RSS/Atom feed or HTML news/blog page.
+    Ищем по: сам домен → популярные поддомены → стандартные RSS пути → страницы новостей.
+    """
+    try:
+        parsed = urlparse(base_url)
+        scheme = parsed.scheme or 'https'
+        host = parsed.netloc
+        root = f"{scheme}://{host}"
+
+        # 0) Базовая страница доступна?
         try:
-            # First, try to get the main page and look for feed links
-            response = requests.get(base_url, timeout=15, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            resp0 = requests.get(base_url, timeout=12, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.0)'
             })
-            response.raise_for_status()
+            if resp0.status_code == 200:
+                # Если вдруг это уже RSS — ок
+                if await self.verify_feed(base_url):
+                    return base_url, 'rss'
+                # Если это сразу раздел новостей (blog/news/press/...), примем как HTML-источник
+                if any(seg in parsed.path.lower() for seg in ['/blog', '/news', '/press', '/newsroom', '/articles', '/media']):
+                    return base_url, 'html'
+        except Exception:
+            pass
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+        # 1) Популярные поддомены, где часто лежат новости
+        subdomains = [
+            'blog', 'news', 'press', 'newsroom', 'media', 'stories', 'source',
+            'about', 'company', 'corporate', 'investors', 'ir', 'pr', 'updates'
+        ]
+        candidate_bases = [root] + [f"{scheme}://{sd}.{host}" for sd in subdomains]
 
-            # Look for RSS/Atom feed links in HTML head
-            for link in soup.find_all('link', rel='alternate'):
-                type_attr = link.get('type', '').lower()
-                if any(feed_type in type_attr for feed_type in ['rss', 'atom', 'xml']):
-                    feed_url = urljoin(base_url, link.get('href'))
-                    feed_type = 'atom' if 'atom' in type_attr else 'rss'
-                    if await self.verify_feed(feed_url):
-                        return feed_url, feed_type
+        # 2) На каждой базе: ищем <link rel="alternate"> (RSS/Atom)
+        for base in candidate_bases:
+            try:
+                r = requests.get(base, timeout=12, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.content, 'html.parser')
+                for link in soup.find_all('link', rel='alternate'):
+                    type_attr = (link.get('type') or '').lower()
+                    if any(t in type_attr for t in ['rss', 'atom', 'xml']):
+                        feed_url = urljoin(base, link.get('href'))
+                        feed_type = 'atom' if 'atom' in type_attr else 'rss'
+                        if await self.verify_feed(feed_url):
+                            return feed_url, feed_type
+            except Exception:
+                continue
 
-            # Try common RSS/Atom paths (prioritize blog/news paths)
-            common_paths = [
-                '/blog/feed', '/blog/rss', '/blog/feed.xml', '/blog/atom.xml',
-                '/news/feed', '/news/rss', '/news/feed.xml', '/news/atom.xml',
-                '/feed', '/feeds', '/rss', '/rss.xml', '/atom.xml',
-                '/press/feed', '/press/rss', '/feed.xml', '/index.xml',
-                '/blog/index.xml', '/news/index.xml'
-            ]
+        # 3) Стандартные RSS пути (и рядом с /blog)
+        common_paths = [
+            '/blog/feed', '/blog/rss', '/blog/feed.xml', '/blog/atom.xml', '/blog/index.xml',
+            '/news/feed', '/news/rss', '/news/feed.xml', '/news/atom.xml', '/news/index.xml',
+            '/rss', '/rss.xml', '/atom.xml', '/feed', '/feed.xml', '/index.xml',
+            '/press/feed', '/press/rss'
+        ]
+        for base in candidate_bases:
             for path in common_paths:
-                feed_url = urljoin(base_url, path)
-                if await self.verify_feed(feed_url):
-                    return feed_url, 'rss'
+                fu = urljoin(base, path)
+                if await self.verify_feed(fu):
+                    return fu, 'rss'
 
-            # Try to find news/blog page and parse HTML (prioritize blog over main site)
-            news_paths = ['/blog', '/news', '/press', '/press-releases', '/newsroom', '/articles']
+        # 4) Разделы новостей/блога как HTML
+        news_paths = ['/blog', '/news', '/press', '/press-releases', '/newsroom', '/articles', '/stories', '/media', '/updates']
+        for base in candidate_bases:
             for path in news_paths:
-                news_url = urljoin(base_url, path)
+                news_url = urljoin(base, path)
                 try:
-                    news_response = requests.get(news_url, timeout=10, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    news_response = requests.get(news_url, timeout=12, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9'
                     })
-                    if news_response.status_code == 200 and await self.verify_html_has_articles(news_url):
+                    if news_response.status_code == 200:
                         return news_url, 'html'
                 except Exception:
                     continue
 
-            # Last resort: try main page
-            if await self.verify_html_has_articles(base_url):
-                return base_url, 'html'
+        # 5) В самом крайнем случае — главная как HTML (надеясь, что там есть новости)
+        try:
+            r = requests.get(root, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.0)'
+            })
+            if r.status_code == 200:
+                return root, 'html'
+        except Exception:
+            pass
 
-        except Exception as e:
-            logger.error(f"Error discovering feed for {base_url}: {e}")
+    except Exception as e:
+        logger.error(f"Error discovering feed for {base_url}: {e}")
 
-        return None, None
+    return None, None
 
     async def verify_feed(self, feed_url: str) -> bool:
         """Verify that a feed URL is valid and parseable"""
