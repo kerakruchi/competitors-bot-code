@@ -818,14 +818,6 @@ I check for updates every 20 minutes and will send you new items as soon as they
 
 
 if __name__ == '__main__':
-    # ==== TOKEN ====
-    # Вариант 1 (рекомендую): из ENV
-    # BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    # if not BOT_TOKEN:
-    #     raise RuntimeError("BOT_TOKEN is not set")
-
-    # Вариант 2 (как у тебя сейчас): захардкоженный токен
-    BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-
+    BOT_TOKEN = "8247686235:AAENkGQjszdXz1Q9DX2HjdAhb8lAtDTEYkM"
     bot = NewsMonitorBot(BOT_TOKEN)
     bot.run()
