@@ -1054,7 +1054,7 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("favourites", self.favourites))
 
         # Категории (строго одна категория в ответе)
-        app.add_handler(CommandHandler("events", self.events_cmd))
+        app.add_handler(CommandHandler("event", self.events_cmd))
         app.add_handler(CommandHandler("product", self.product_cmd))
         app.add_handler(CommandHandler("cases", self.cases_cmd))
         app.add_handler(CommandHandler("other", self.other_cmd))
