@@ -154,10 +154,11 @@ class NewsMonitorBot:
                     if await self.verify_feed(feed_url):
                         return feed_url, feed_type
             
-            # Try common RSS/Atom paths
+            # Try common RSS/Atom paths (prioritize blog/news paths)
             common_paths = [
+                '/blog/feed', '/blog/rss', '/blog/feed.xml', '/blog/atom.xml',
+                '/news/feed', '/news/rss', '/news/feed.xml', '/news/atom.xml',
                 '/feed', '/feeds', '/rss', '/rss.xml', '/atom.xml',
-                '/blog/feed', '/blog/rss', '/news/feed', '/news/rss',
                 '/press/feed', '/press/rss', '/feed.xml', '/index.xml',
                 '/blog/index.xml', '/news/index.xml'
             ]
@@ -167,8 +168,8 @@ class NewsMonitorBot:
                 if await self.verify_feed(feed_url):
                     return feed_url, 'rss'
             
-            # Try to find news page and parse HTML
-            news_paths = ['/news', '/press', '/blog', '/press-releases', '/newsroom']
+            # Try to find news/blog page and parse HTML (prioritize blog over main site)
+            news_paths = ['/blog', '/news', '/press', '/press-releases', '/newsroom', '/articles']
             for path in news_paths:
                 news_url = urljoin(base_url, path)
                 try:
@@ -176,9 +177,15 @@ class NewsMonitorBot:
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     })
                     if news_response.status_code == 200:
-                        return news_url, 'html'
+                        # Verify this page has actual articles
+                        if await self.verify_html_has_articles(news_url):
+                            return news_url, 'html'
                 except:
                     continue
+            
+            # Last resort: try main page
+            if await self.verify_html_has_articles(base_url):
+                return base_url, 'html'
                     
         except Exception as e:
             logger.error(f"Error discovering feed for {base_url}: {e}")
@@ -199,6 +206,43 @@ class NewsMonitorBot:
             return len(feed.entries) > 0 and not feed.bozo
             
         except Exception:
+            return False
+
+    async def verify_html_has_articles(self, url: str) -> bool:
+        """Verify that an HTML page contains actual articles/news"""
+        try:
+            response = requests.get(url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            if response.status_code != 200:
+                return False
+                
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Look for indicators that this is a blog/news page
+            blog_indicators = [
+                'article', '.post', '.blog-post', '.news-item', 
+                '[class*="post"]', '[class*="article"]', '[class*="blog"]'
+            ]
+            
+            article_count = 0
+            for selector in blog_indicators:
+                try:
+                    elements = soup.select(selector)
+                    for elem in elements:
+                        # Check if element has title and looks like an article
+                        title_elem = elem.find(['h1', 'h2', 'h3', 'h4'])
+                        link_elem = elem.find('a', href=True)
+                        if title_elem and link_elem and len(title_elem.get_text().strip()) > 10:
+                            article_count += 1
+                            if article_count >= 2:  # Found at least 2 articles
+                                return True
+                except:
+                    continue
+                    
+            return False
+            
+        except:
             return False
 
     async def send_initial_items(self, update: Update, source_id: int):
@@ -285,7 +329,7 @@ class NewsMonitorBot:
                     })
                     
             elif feed_type == 'html':
-                # Enhanced HTML parsing
+                # Enhanced HTML parsing for news/blog pages
                 response = requests.get(feed_url, timeout=15, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
@@ -293,84 +337,126 @@ class NewsMonitorBot:
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Enhanced selectors for finding articles
+                # Enhanced selectors specifically for blog/news articles
                 article_selectors = [
                     'article',
-                    '.post', '.blog-post', '.news-item', '.article-item',
-                    '.entry', '.post-item', '.blog-item', '.news-post',
-                    '[class*="post"]', '[class*="article"]', '[class*="blog"]',
-                    '[class*="news"]', '[class*="entry"]', '[class*="item"]'
+                    '.blog-post', '.post', '.news-item', '.article-item', '.entry',
+                    '.post-item', '.blog-item', '.news-post', '.article-card',
+                    '[class*="post-"]', '[class*="blog-"]', '[class*="article-"]', 
+                    '[class*="news-"]', '[class*="entry-"]'
                 ]
                 
                 found_items = []
                 for selector in article_selectors:
                     try:
                         elements = soup.select(selector)
-                        if elements and len(elements) >= 3:  # Good selector if it finds multiple items
-                            found_items = elements[:20]  # Take up to 20 items
+                        # Filter elements that actually look like articles
+                        valid_articles = []
+                        for elem in elements:
+                            # Must have a meaningful title
+                            title_elem = elem.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
+                            # Must have a link
+                            link_elem = elem.find('a', href=True)
+                            
+                            if title_elem and link_elem:
+                                title_text = title_elem.get_text().strip()
+                                link_href = link_elem.get('href', '')
+                                
+                                # Filter out non-article links
+                                if (len(title_text) > 15 and  # Meaningful title length
+                                    not any(skip in title_text.lower() for skip in ['contact', 'about', 'privacy', 'terms', 'cookie']) and
+                                    not any(skip in link_href.lower() for skip in ['mailto:', 'tel:', '#', 'javascript:', '/contact', '/about']) and
+                                    ('blog' in link_href.lower() or 'news' in link_href.lower() or 'article' in link_href.lower() or len(link_href.split('/')) > 4)):
+                                    valid_articles.append(elem)
+                        
+                        if len(valid_articles) >= 3:  # Good selector if it finds multiple valid articles
+                            found_items = valid_articles[:20]
+                            logger.info(f"Using selector '{selector}' - found {len(found_items)} articles")
                             break
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Error with selector {selector}: {e}")
                         continue
                 
-                # If no good selector found, try a more general approach
+                # If no good selector found, try a more targeted approach for blog pages
                 if not found_items:
-                    # Look for common container patterns
-                    containers = soup.find_all(['div', 'section'], class_=re.compile(r'blog|post|article|news|content|main', re.I))
-                    for container in containers:
-                        articles = container.find_all(['article', 'div', 'li'], limit=20)
-                        if len(articles) > 5:  # If we found a container with many items
-                            found_items = articles
+                    # Look specifically for blog/news containers
+                    blog_containers = soup.find_all(['div', 'section', 'main'], 
+                        class_=re.compile(r'blog|post|article|news|content|main|grid|list', re.I))
+                    
+                    for container in blog_containers:
+                        # Look for repeating patterns that could be articles
+                        potential_articles = container.find_all(['div', 'article', 'li'], limit=30)
+                        valid_articles = []
+                        
+                        for article in potential_articles:
+                            title_elem = article.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
+                            link_elem = article.find('a', href=True)
+                            
+                            if title_elem and link_elem:
+                                title_text = title_elem.get_text().strip()
+                                link_href = link_elem.get('href', '')
+                                
+                                if (len(title_text) > 15 and
+                                    not any(skip in title_text.lower() for skip in ['contact', 'about', 'privacy', 'terms']) and
+                                    not any(skip in link_href.lower() for skip in ['mailto:', 'tel:', '#', 'javascript:']) and
+                                    (link_href.startswith('http') or link_href.startswith('/') and len(link_href) > 5)):
+                                    valid_articles.append(article)
+                        
+                        if len(valid_articles) >= 3:
+                            found_items = valid_articles[:20]
+                            logger.info(f"Found {len(found_items)} articles in container")
                             break
                 
-                logger.info(f"Found {len(found_items)} potential articles on HTML page")
+                logger.info(f"Processing {len(found_items)} potential articles from HTML page")
                 
                 for item in found_items:
                     try:
                         # Enhanced title extraction
-                        title_elem = None
-                        title_selectors = [
-                            'h1', 'h2', 'h3', 'h4', 'h5', 
-                            '.title', '.headline', '.post-title', '.article-title',
-                            '[class*="title"]', '[class*="headline"]'
-                        ]
+                        title_elem = item.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
                         
-                        for selector in title_selectors:
-                            title_elem = item.select_one(selector)
-                            if title_elem and title_elem.get_text(strip=True):
-                                break
+                        if not title_elem:
+                            continue
                         
                         # Enhanced link extraction
                         link_elem = item.find('a', href=True)
                         if not link_elem:
-                            # Look for link in title
-                            if title_elem:
-                                link_elem = title_elem.find('a', href=True) or title_elem.find_parent('a', href=True)
+                            # Check if title itself is a link
+                            link_elem = title_elem.find('a', href=True)
+                            if not link_elem:
+                                link_elem = title_elem.find_parent('a', href=True)
+                        
+                        if not link_elem:
+                            continue
+                        
+                        title = title_elem.get_text().strip()
+                        title = re.sub(r'\s+', ' ', title)  # Remove extra whitespace
+                        
+                        # Skip titles that are too short or look like navigation
+                        if (len(title) < 15 or 
+                            any(skip in title.lower() for skip in ['contact us', 'about us', 'privacy policy', 'terms', 'customer stories', 'solutions'])):
+                            continue
+                        
+                        link = urljoin(feed_url, link_elem['href'])
+                        
+                        # Skip duplicate links or invalid links
+                        if (any(existing['link'] == link for existing in items) or 
+                            'mailto:' in link or 'tel:' in link or link.endswith('#')):
+                            continue
                         
                         # Enhanced date extraction
                         pub_date = self.extract_date_from_html(item)
                         
-                        if title_elem and link_elem:
-                            title = title_elem.get_text().strip()
-                            # Clean up title
-                            title = re.sub(r'\s+', ' ', title)  # Remove extra whitespace
-                            title = title[:200] if len(title) > 200 else title  # Limit length
-                            
-                            if len(title) < 10:  # Skip very short titles
-                                continue
-                                
-                            link = urljoin(feed_url, link_elem['href'])
-                            
-                            # Skip duplicate links
-                            if any(existing['link'] == link for existing in items):
-                                continue
-                            
-                            items.append({
-                                'id': link,
-                                'title': title,
-                                'link': link,
-                                'date': pub_date
-                            })
-                            
+                        # If we couldn't find a date in the item, try to extract from the link
+                        if pub_date == datetime.now() or (datetime.now() - pub_date).total_seconds() < 60:
+                            pub_date = await self.extract_date_from_article_page(link)
+                        
+                        items.append({
+                            'id': link,
+                            'title': title[:200],  # Limit title length
+                            'link': link,
+                            'date': pub_date
+                        })
+                        
                     except Exception as e:
                         logger.debug(f"Error parsing HTML item: {e}")
                         continue
@@ -380,6 +466,72 @@ class NewsMonitorBot:
             
         logger.info(f"Successfully parsed {len(items)} items")
         return items
+
+    async def extract_date_from_article_page(self, article_url: str) -> datetime:
+        """Extract publication date by visiting the actual article page"""
+        try:
+            response = requests.get(article_url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            if response.status_code != 200:
+                return datetime.now()
+                
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Look for meta tags with publication date
+            meta_selectors = [
+                'meta[property="article:published_time"]',
+                'meta[property="article:modified_time"]',
+                'meta[name="publish_date"]',
+                'meta[name="publication_date"]',
+                'meta[name="date"]',
+                'meta[name="created"]'
+            ]
+            
+            for selector in meta_selectors:
+                meta_elem = soup.select_one(selector)
+                if meta_elem and meta_elem.get('content'):
+                    try:
+                        return date_parser.parse(meta_elem['content'], ignoretz=True)
+                    except:
+                        continue
+            
+            # Look for time elements
+            time_elem = soup.select_one('time[datetime]')
+            if time_elem:
+                try:
+                    return date_parser.parse(time_elem['datetime'], ignoretz=True)
+                except:
+                    pass
+            
+            # Look for date patterns in the text
+            text_content = soup.get_text()
+            
+            # Look for patterns like "July 30, 2024" or "Jul 30"
+            date_patterns = [
+                r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b',
+                r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})\b',
+                r'\b(\d{4}-\d{2}-\d{2})\b',
+                r'\b(\d{1,2}/\d{1,2}/\d{4})\b'
+            ]
+            
+            for pattern in date_patterns:
+                matches = re.search(pattern, text_content, re.IGNORECASE)
+                if matches:
+                    try:
+                        if len(matches.groups()) == 3:  # Month name pattern
+                            month_name, day, year = matches.groups()
+                            date_str = f"{month_name} {day}, {year}"
+                        else:
+                            date_str = matches.group(1)
+                        return date_parser.parse(date_str, ignoretz=True)
+                    except:
+                        continue
+            
+        except Exception as e:
+            logger.debug(f"Error extracting date from {article_url}: {e}")
+        
+        return datetime.now()
 
     def parse_publication_date(self, entry) -> datetime:
         """Enhanced date parsing for RSS/Atom entries"""
@@ -530,207 +682,4 @@ class NewsMonitorBot:
             
         domain = context.args[0].lower()
         if domain.startswith('www.'):
-            domain = domain[4:]
-            
-        user_id = update.effective_user.id
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get source ID
-        cursor.execute("SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
-        result = cursor.fetchone()
-        
-        if not result:
-            await update.message.reply_text(f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.", parse_mode=ParseMode.MARKDOWN)
-            conn.close()
-            return
-        
-        source_id = result[0]
-        
-        # Delete source and its cached items
-        cursor.execute("DELETE FROM item_cache WHERE source_id = ?", (source_id,))
-        cursor.execute("DELETE FROM sources WHERE id = ?", (source_id,))
-        
-        conn.commit()
-        conn.close()
-        
-        await update.message.reply_text(f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN)
-
-    async def test_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Test command: /test <domain>"""
-        if not context.args:
-            await update.message.reply_text("Usage: /test <domain>\n\nExample:\n`/test microsoft.com`", parse_mode=ParseMode.MARKDOWN)
-            return
-            
-        domain = context.args[0].lower()
-        if domain.startswith('www.'):
-            domain = domain[4:]
-            
-        user_id = update.effective_user.id
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT feed_url, feed_type FROM sources WHERE user_id = ? AND domain = ?", 
-                      (user_id, domain))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            await update.message.reply_text(f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        feed_url, feed_type = result
-        
-        await update.message.reply_text(f"🔍 Testing {domain}...")
-        
-        try:
-            items = await self.fetch_items(feed_url, feed_type)
-            
-            if items:
-                items.sort(key=lambda x: x['date'], reverse=True)
-                latest_item = items[0]
-                message = f"✅ *Test successful for {domain}*\n\n"
-                message += f"Latest item:\n{self.format_news_item(latest_item)}"
-                message += f"📊 Total items found: {len(items)}"
-                await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            else:
-                await update.message.reply_text(f"⚠️ No items found for {domain}")
-                
-        except Exception as e:
-            await update.message.reply_text(f"❌ Test failed for {domain}: {str(e)}")
-
-    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
-        """Periodic check for new items"""
-        logger.info("Starting periodic check for all sources...")
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get all active sources that have been initially sent
-        cursor.execute('''
-            SELECT id, user_id, domain, feed_url, feed_type
-            FROM sources 
-            WHERE status = 'active' AND first_sent = TRUE
-        ''')
-        
-        sources = cursor.fetchall()
-        logger.info(f"Checking {len(sources)} active sources...")
-        
-        for source_id, user_id, domain, feed_url, feed_type in sources:
-            try:
-                # Fetch latest items
-                items = await self.fetch_items(feed_url, feed_type)
-                
-                if not items:
-                    continue
-                
-                # Get cached item IDs
-                cursor.execute("SELECT item_id FROM item_cache WHERE source_id = ?", (source_id,))
-                cached_ids = {row[0] for row in cursor.fetchall()}
-                
-                # Find new items
-                new_items = [item for item in items if item['id'] not in cached_ids]
-                
-                if new_items:
-                    logger.info(f"Found {len(new_items)} new items for {domain}")
-                    
-                    # Sort by date (oldest first for sending)
-                    new_items.sort(key=lambda x: x['date'])
-                    
-                    # Send new items to user (limit to 3 per check)
-                    for item in new_items[:3]:
-                        message = f"🆕 *New from {domain}*\n\n{self.format_news_item(item)}"
-                        
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id, 
-                                text=message, 
-                                parse_mode=ParseMode.MARKDOWN,
-                                disable_web_page_preview=True
-                            )
-                            
-                            # Cache the item
-                            cursor.execute('''
-                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (source_id, item['id'], item['title'], item['link'], item['date']))
-                            
-                            # Small delay between messages
-                            await asyncio.sleep(1)
-                            
-                        except Exception as e:
-                            logger.error(f"Error sending message to user {user_id}: {e}")
-                
-                # Update last check time
-                cursor.execute("UPDATE sources SET last_check = ? WHERE id = ?", 
-                             (datetime.now(), source_id))
-                
-            except Exception as e:
-                logger.error(f"Error checking source {domain}: {e}")
-        
-        conn.commit()
-        conn.close()
-        logger.info("Periodic check completed.")
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start command handler"""
-        welcome_message = """
-🤖 *Welcome to News Monitor Bot!*
-
-I help you monitor company news feeds and get instant notifications when new content is published.
-
-*📋 Commands:*
-- `/add <url>` - Add a company website to monitor
-- `/list` - Show all your monitored sources  
-- `/remove <domain>` - Remove a source from monitoring
-- `/test <domain>` - Test a source manually
-
-*🚀 How it works:*
-1. Add a company website with `/add <url>`
-2. I'll automatically find their RSS feed or news page
-3. You'll immediately get the 3 most recent news items
-4. I'll continuously monitor and notify you of new posts
-
-*💡 Examples:*
-`/add https://microsoft.com`
-`/add techcrunch.com`
-`/add https://blog.openai.com`
-
-*🔔 Monitoring:*
-I check for updates every 20 minutes and will send you new items as soon as they appear!
-
-Ready to start? Try `/add <website_url>` now!
-        """
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
-
-    def run(self):
-        """Run the bot"""
-        app = Application.builder().token(self.token).build()
-        
-        # Add command handlers
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("add", self.add_source))
-        app.add_handler(CommandHandler("list", self.list_sources))
-        app.add_handler(CommandHandler("remove", self.remove_source))
-        app.add_handler(CommandHandler("test", self.test_source))
-        
-        # Add periodic job for monitoring (every 20 minutes)
-        job_queue = app.job_queue
-        job_queue.run_repeating(self.periodic_check, interval=1200, first=60)  # 20 minutes, start after 1 minute
-        
-        print("🤖 News Monitor Bot is starting...")
-        print("🔑 Token configured successfully")
-        print("📊 Monitoring checks every 20 minutes")
-        print("💾 Database: news_monitor.db")
-        
-        # Run the bot
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    # Your bot token
-    BOT_TOKEN = "8247686235:AAENkGQjszdXz1Q9DX2HjdAhb8lAtDTEYkM"
-    
-    bot = NewsMonitorBot(BOT_TOKEN)
-    bot.run()
+            domain = domain[
