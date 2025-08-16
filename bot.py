@@ -292,7 +292,7 @@ class NewsMonitorBot:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
     # --- Команды категорий: возвращаем только выбранную категорию одним сообщением ---
-    async def events_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def event_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "event")
 
     async def product_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,7 +370,7 @@ class NewsMonitorBot:
             "• `/add <url>` — добавить домен\n"
             "• `/remove <domain>` — удалить домен\n"
             "• `/favourites` — показать избранные\n"
-            "• `/events` — только ивенты\n"
+            "• `/event` — только ивенты\n"
             "• `/product` — про продукты\n"
             "• `/cases` — кейсы\n"
             "• `/other` — другое\n\n"
@@ -386,7 +386,7 @@ class NewsMonitorBot:
             BotCommand("add", "Добавить домен: /add url"),
             BotCommand("remove", "Удалить домен: /remove domain"),
             BotCommand("favourites", "Показать избранные"),
-            BotCommand("events", "Новости про ивенты"),
+            BotCommand("event", "Новости про ивенты"),
             BotCommand("product", "Новости про продукты"),
             BotCommand("cases", "Новости про кейсы"),
             BotCommand("other", "Другие новости"),
@@ -1054,7 +1054,7 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("favourites", self.favourites))
 
         # Категории (строго одна категория в ответе)
-        app.add_handler(CommandHandler("event", self.events_cmd))
+        app.add_handler(CommandHandler("event", self.event_cmd))
         app.add_handler(CommandHandler("product", self.product_cmd))
         app.add_handler(CommandHandler("cases", self.cases_cmd))
         app.add_handler(CommandHandler("other", self.other_cmd))
