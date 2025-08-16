@@ -14,6 +14,8 @@ from dateutil import parser as date_parser
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
+
 
 # ------------------------- Logging -------------------------
 logging.basicConfig(
@@ -294,6 +296,47 @@ I check for updates every 20 minutes and will send you new items as soon as they
         """
         await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
+
+
+
+    # --------- Keyboard (menu) ----------
+    def _main_keyboard(self) -> ReplyKeyboardMarkup:
+        keyboard = [
+            ["/list", "/add"],
+            ["/test", "/remove"],
+            ["/menu_off"],
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "📋 Выберите команду кнопкой ниже:",
+            reply_markup=self._main_keyboard()
+        )
+
+    async def menu_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "🧹 Клавиатура скрыта. Включить снова: /menu",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    async def _post_init(self, app: Application):
+        commands = [
+            BotCommand("start", "Показать справку"),
+            BotCommand("menu", "Показать клавиатуру с командами"),
+            BotCommand("list", "Список источников"),
+            BotCommand("add", "Добавить источник: /add <url>"),
+            BotCommand("test", "Тест источника: /test <domain>"),
+            BotCommand("remove", "Удалить источник: /remove <domain>"),
+            BotCommand("menu_off", "Скрыть клавиатуру"),
+        ]
+        await app.bot.set_my_commands(commands)
+
+
+
+
+
+    
     # ------------------ Scheduler ------------------
     async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Starting periodic check for all sources...")
@@ -962,26 +1005,34 @@ I check for updates every 20 minutes and will send you new items as soon as they
             logger.exception("Error sending initial items")
 
     # ------------------ Runner ------------------
-    def run(self):
-        app = Application.builder().token(self.token).build()
+def run(self):
+    app = Application.builder().token(self.token).build()
 
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("add", self.add_source))
-        app.add_handler(CommandHandler("list", self.list_sources))
-        app.add_handler(CommandHandler("remove", self.remove_source))
-        app.add_handler(CommandHandler("test", self.test_source))
+    # Хендлеры команд
+    app.add_handler(CommandHandler("start", self.start))
+    app.add_handler(CommandHandler("menu", self.menu))           # ← добавили
+    app.add_handler(CommandHandler("menu_off", self.menu_off))   # ← добавили
+    app.add_handler(CommandHandler("add", self.add_source))
+    app.add_handler(CommandHandler("list", self.list_sources))
+    app.add_handler(CommandHandler("remove", self.remove_source))
+    app.add_handler(CommandHandler("test", self.test_source))
 
-        job_queue = app.job_queue
-        if job_queue:
-            job_queue.run_repeating(self.periodic_check, interval=1200, first=60)
-        else:
-            logger.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
+    # Зарегистрировать Bot Menu при старте
+    app.post_init = self._post_init  # ← добавили
 
-        print("🤖 News Monitor Bot is starting...")
-        print("📊 Monitoring checks every 20 minutes")
-        print("💾 Database: news_monitor.db")
+    # Периодические проверки
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(self.periodic_check, interval=1200, first=60)
+    else:
+        logger.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
 
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 News Monitor Bot is starting...")
+    print("📊 Monitoring checks every 20 minutes")
+    print("💾 Database: news_monitor.db")
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 
 # ======================== MAIN ===========================
