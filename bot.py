@@ -2,66 +2,45 @@ import os
 import asyncio
 import sqlite3
 import logging
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dtime
 from typing import List, Dict, Optional, Tuple
-import re
-from dateutil import parser as date_parser
+
 from zoneinfo import ZoneInfo
-
 from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+# --- наши модули ---
+from newsbot.config import (
+    DB_PATH,
+    SCHEDULE_TZ,
+    SCHEDULE_HOUR,
+    SCHEDULE_MINUTE,
+    CAT_RU,
+)
+from newsbot.fetch import (
+    normalize_url,
+    discover_feed,
+    fetch_items,
+)
+from newsbot.formatting import (
+    format_news_item,
+    _format_compact_line,
+)
 
 # ------------------------- Logging -------------------------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger("news-monitor-bot")
-
-
-# -------------------- Per-domain rules --------------------
-DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    "spot.ai":     {"allow": ("/blog",), "ban": ("/pricing", "/careers", "/docs", "/documentation", "/solutions", "/product", "/products")},
-    "lumana.ai":   {"allow": ("/blog", "/news"), "ban": ("/solutions", "/solution", "/product", "/products", "/pricing", "/careers")},
-    "irisity.com": {"allow": ("/news", "/blog"), "ban": ()},
-}
-
-DEFAULT_ALLOWED = ("/blog", "/news", "/press", "/press-releases", "/newsroom", "/articles", "/story", "/stories", "/updates")
-DEFAULT_BANNED  = ("/solutions", "/solution", "/product", "/products", "/pricing", "/careers", "/docs", "/documentation")
-
-
-# ----------------------- HTTP headers ----------------------
-DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (compatible; NewsMonitorBot/1.5)'
-}
-
-
-# ----------------------- Category i18n ----------------------
-CAT_RU = {
-    "event": "ивент",
-    "product": "продукт",
-    "cases": "кейс",
-    "other": "другое",
-}
-CAT_EMOJI = {
-    "event": "🎪",
-    "product": "🧩",
-    "cases": "📘",
-    "other": "🏷️",
-}
 
 
 # ========================= BOT ============================
 class NewsMonitorBot:
     def __init__(self, token: str):
         self.token = token
-        self.db_path = "news_monitor.db"
+        self.db_path = DB_PATH
         self.init_database()
 
     # ------------------ DB init ------------------
@@ -70,7 +49,8 @@ class NewsMonitorBot:
         cursor = conn.cursor()
 
         # Источники
-        cursor.execute('''
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -84,10 +64,12 @@ class NewsMonitorBot:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, domain)
             )
-        ''')
+        """
+        )
 
-        # Кэш новостей (для дедупликации)
-        cursor.execute('''
+        # Кеш новостей (для дедупликации и выборок)
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS item_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER,
@@ -99,10 +81,12 @@ class NewsMonitorBot:
                 FOREIGN KEY (source_id) REFERENCES sources (id),
                 UNIQUE(source_id, item_id)
             )
-        ''')
+        """
+        )
 
-        # Избранное (на будущее)
-        cursor.execute('''
+        # Избранное (опционально)
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS favourites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -114,47 +98,39 @@ class NewsMonitorBot:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, link)
             )
-        ''')
+        """
+        )
 
         conn.commit()
         conn.close()
 
-    # ------------------ Helpers ------------------
-    @staticmethod
-    def get_domain_from_url(u: str) -> str:
-        netloc = urlparse(u).netloc.lower()
-        return netloc[4:] if netloc.startswith("www.") else netloc
-
-    def normalize_url(self, url: str) -> Tuple[str, str]:
-        """
-        Приводим URL к виду scheme://host и, если путь указывает на блог/новости,
-        оставляем корень соответствующего раздела.
-        """
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        if host.startswith('www.'):
-            host = host[4:]
-
-        root = f"{parsed.scheme}://{host}"
-
-        path = (parsed.path or '').strip('/')
-        news_roots = ('blog', 'news', 'press', 'newsroom', 'articles', 'media', 'stories', 'updates')
-        if path and path.split('/')[0].lower() in news_roots:
-            normalized_url = f"{root}/{path.split('/')[0]}"
-        else:
-            normalized_url = root
-
-        return normalized_url, host
-
     # ------------------ Commands ------------------
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        tz = SCHEDULE_TZ
+        hh = SCHEDULE_HOUR
+        mm = SCHEDULE_MINUTE
+        welcome_message = (
+            "🤖 *Welcome to News Monitor Bot!*\n\n"
+            "Я помогу мониторить новости компаний и присылать новые посты.\n\n"
+            "*Команды:*\n"
+            "• `/start` — запустить бота\n"
+            "• `/list` — список доменов\n"
+            "• `/add <url>` — добавить домен\n"
+            "• `/remove <domain>` — удалить домен\n"
+            "• `/favourites` — показать избранные\n"
+            "• `/event` — только ивенты\n"
+            "• `/product` — про продукты\n"
+            "• `/cases` — кейсы\n"
+            "• `/other` — другое\n\n"
+            f"⏰ Автопроверка: *каждый день в {hh:02d}:{mm:02d} ({tz}).*"
+        )
+        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+
     async def add_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text(
                 "Usage: /add <company_website_url>\n\nExample:\n`/add https://microsoft.com`\n`/add techcrunch.com`",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
             )
             return
 
@@ -162,40 +138,90 @@ class NewsMonitorBot:
         user_id = update.effective_user.id
 
         try:
-            normalized_url, domain = self.normalize_url(url)
+            normalized_url, domain = normalize_url(url)
 
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
+            cursor.execute(
+                "SELECT id FROM sources WHERE user_id = ? AND domain = ?",
+                (user_id, domain),
+            )
             if cursor.fetchone():
-                await update.message.reply_text(f"❌ {domain} is already being monitored.")
+                await update.message.reply_text(
+                    f"❌ {domain} is already being monitored."
+                )
                 conn.close()
                 return
 
-            await update.message.reply_text(f"🔍 Analyzing {domain}... Looking for news feeds...")
+            await update.message.reply_text(
+                f"🔍 Analyzing {domain}... Looking for news feeds..."
+            )
 
-            feed_url, feed_type = await self.discover_feed(normalized_url)
+            feed_url, feed_type = await discover_feed(normalized_url)
             if not feed_url:
-                await update.message.reply_text(f"❌ Could not find a news feed for {domain}")
+                await update.message.reply_text(
+                    f"❌ Could not find a news feed for {domain}"
+                )
                 conn.close()
                 return
 
-            cursor.execute('''
+            # Сохраняем источник
+            cursor.execute(
+                """
                 INSERT INTO sources (user_id, domain, url, feed_url, feed_type)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, domain, normalized_url, feed_url, feed_type))
-
+                """,
+                (user_id, domain, normalized_url, feed_url, feed_type),
+            )
             source_id = cursor.lastrowid
             conn.commit()
+
+            # Получаем ВСЕ текущие материалы и сразу кешируем их,
+            # чтобы не присылать задним числом.
+            items = await fetch_items(feed_url, feed_type)
+            if items:
+                for it in items:
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                source_id,
+                                it.get("id"),
+                                it.get("title"),
+                                it.get("link"),
+                                it.get("date"),
+                            ),
+                        )
+                    except Exception:
+                        continue
+                conn.commit()
+
             conn.close()
 
+            tz = SCHEDULE_TZ
+            hh = SCHEDULE_HOUR
+            mm = SCHEDULE_MINUTE
             await update.message.reply_text(
                 f"✅ Added {domain}. Monitoring started.\n"
                 f"📡 Feed type: {feed_type.upper()}\n"
-                f"⏰ Daily checks at 12:00 (Europe/Moscow)",
+                f"⏰ Daily checks at {hh:02d}:{mm:02d} ({tz})"
             )
 
-            await self.send_initial_items(update, source_id)
+            # Отправляем только 3 последних карточки (но в кеш уже положили все)
+            await self.send_initial_preview(update, domain, items or [], limit=3)
+
+            # Отметим, что первичная отправка была
+            conn2 = sqlite3.connect(self.db_path, timeout=30)
+            c2 = conn2.cursor()
+            c2.execute(
+                "UPDATE sources SET first_sent = TRUE, last_check = ? WHERE id = ?",
+                (datetime.now(), source_id),
+            )
+            conn2.commit()
+            conn2.close()
 
         except Exception as e:
             logger.exception("Error adding source")
@@ -206,25 +232,40 @@ class NewsMonitorBot:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
-        cursor.execute('''
+        cursor.execute(
+            """
             SELECT domain, status, feed_type, last_check, created_at
             FROM sources WHERE user_id = ?
             ORDER BY created_at DESC
-        ''', (user_id,))
+            """,
+            (user_id,),
+        )
         sources = cursor.fetchall()
         conn.close()
 
         if not sources:
             await update.message.reply_text(
                 "📭 No sources being monitored.\n\nUse `/add <url>` to start monitoring a website!",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
             )
             return
 
         message = "📊 *Your Monitored Sources:*\n\n"
-        for i, (domain, status, feed_type, last_check, created_at) in enumerate(sources, 1):
+        for i, (domain, status, feed_type, last_check, created_at) in enumerate(
+            sources, 1
+        ):
             status_emoji = "🟢" if status == "active" else "🔴"
-            last_check_str = "Never" if not last_check else datetime.fromisoformat(last_check).strftime("%m-%d %H:%M")
+            if not last_check:
+                last_check_str = "Never"
+            else:
+                try:
+                    last_check_str = (
+                        datetime.fromisoformat(last_check)
+                        if isinstance(last_check, str)
+                        else last_check
+                    ).strftime("%m-%d %H:%M")
+                except Exception:
+                    last_check_str = str(last_check)
             message += f"{i}. {status_emoji} *{domain}*\n"
             message += f"   📡 Type: {feed_type.upper()}\n"
             message += f"   🕒 Last check: {last_check_str}\n\n"
@@ -235,24 +276,28 @@ class NewsMonitorBot:
         if not context.args:
             await update.message.reply_text(
                 "Usage: /remove <domain>\n\nExample:\n`/remove microsoft.com`",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
             )
             return
 
         domain = context.args[0].lower()
-        if domain.startswith('www.'):
+        if domain.startswith("www."):
             domain = domain[4:]
 
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
-        cursor.execute("SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain))
+        cursor.execute(
+            "SELECT id FROM sources WHERE user_id = ? AND domain = ?",
+            (user_id, domain),
+        )
         result = cursor.fetchone()
+
         if not result:
             await update.message.reply_text(
                 f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
             )
             conn.close()
             return
@@ -263,20 +308,25 @@ class NewsMonitorBot:
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN
+        )
 
     async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать избранные (если когда-то будут добавляться внешней командой)."""
+        """Показать избранные (если добавлялись внешне)."""
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute(
+            """
             SELECT title, link, pub_date, COALESCE(category, 'other'), source_domain
             FROM favourites
             WHERE user_id = ?
             ORDER BY created_at DESC
             LIMIT 10
-        ''', (user_id,))
+            """,
+            (user_id,),
+        )
         rows = cursor.fetchall()
         conn.close()
 
@@ -286,14 +336,23 @@ class NewsMonitorBot:
 
         lines = ["⭐️ *Избранные материалы:*"]
         for title, link, pub_date, category, domain in rows:
-            dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+            try:
+                dt = (
+                    datetime.fromisoformat(pub_date)
+                    if isinstance(pub_date, str)
+                    else pub_date
+                )
+            except Exception:
+                dt = datetime.now()
             date_str = dt.strftime("%b %d, %Y")
-            emoji = CAT_EMOJI.get(category, "🏷️")
-            lines.append(f"{emoji} *{title}*\n📅 {date_str}\n🏷️ {category}\n🔗 {link}\n")
+            # эмодзи берётся внутри компактного форматтера — тут простая карточка:
+            lines.append(f"*{title}*\n📅 {date_str}\n🔗 {link}\n")
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+        )
 
-    # --- Команды категорий: только выбранная категория ---
+    # --- Команды категорий: показываем ТОЛЬКО выбранную категорию ---
     async def event_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "event")
 
@@ -306,29 +365,45 @@ class NewsMonitorBot:
     async def other_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "other")
 
-    async def _send_category_list(self, update: Update, category: str, limit: int = 10):
-        """Берём из кэша пользователя, переклассифицируем и фильтруем строго по категории."""
+    async def _send_category_list(
+        self, update: Update, category: str, limit: int = 10
+    ):
+        """
+        Берём элементы пользователя из кеша, переклассифицируем на лету (по title+link)
+        и возвращаем только выбранную категорию одним сообщением.
+        """
+        from newsbot.classify import classify_news  # локальный импорт, чтобы избежать циклов
+
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute(
+            """
             SELECT ic.title, ic.link, ic.pub_date
             FROM item_cache ic
             JOIN sources s ON s.id = ic.source_id
             WHERE s.user_id = ?
             ORDER BY ic.pub_date DESC
-            LIMIT 200
-        ''', (user_id,))
+            LIMIT 300
+            """,
+            (user_id,),
+        )
         rows = cursor.fetchall()
         conn.close()
 
         items = []
         for title, link, pub_date in rows:
             try:
-                cat = self.classify_news(title or "", link or "")
+                cat = classify_news(title or "", link or "")
                 if cat == category:
-                    dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
-                    items.append({"title": title, "link": link, "date": dt, "category": cat})
+                    dt = (
+                        datetime.fromisoformat(pub_date)
+                        if isinstance(pub_date, str)
+                        else pub_date
+                    )
+                    items.append(
+                        {"title": title, "link": link, "date": dt, "category": cat}
+                    )
             except Exception:
                 continue
 
@@ -347,40 +422,140 @@ class NewsMonitorBot:
         }
         lines = [f"*{title_map.get(category, 'Новости')}*"]
         for it in items:
-            lines.append(self._format_compact_line(it))
+            lines.append(_format_compact_line(it))
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-    def _format_compact_line(self, item: Dict) -> str:
-        dt = item["date"]
-        date_str = dt.strftime("%b %d, %Y")
-        cat = item.get("category", "other")
-        emoji = CAT_EMOJI.get(cat, "🏷️")
-        title = item["title"]
-        if len(title) > 140:
-            title = title[:137] + "…"
-        return f"{emoji} *{title}*\n📅 {date_str}\n🔗 {item['link']}\n"
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_message = (
-            "🤖 *Welcome to News Monitor Bot!*\n\n"
-            "Я помогу мониторить новости компаний и присылать новые посты.\n\n"
-            "*Команды:*\n"
-            "• `/start` — запустить бота\n"
-            "• `/list` — список доменов\n"
-            "• `/add <url>` — добавить домен\n"
-            "• `/remove <domain>` — удалить домен\n"
-            "• `/favourites` — показать избранные\n"
-            "• `/event` — только ивенты\n"
-            "• `/product` — про продукты\n"
-            "• `/cases` — кейсы\n"
-            "• `/other` — другое\n\n"
-            "⏰ Автопроверка: *каждый день в 12:00 (Europe/Moscow).*"
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
         )
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
+    # ------------------ Initial preview ------------------
+    async def send_initial_preview(
+        self,
+        update: Update,
+        domain: str,
+        items: List[Dict],
+        limit: int = 3,
+    ):
+        """Отправляем только превью из N карточек (кеш уже заполнен ранее)."""
+        if not items:
+            await update.message.reply_text(f"📭 No recent items found for {domain}")
+            return
+
+        items_sorted = sorted(items, key=lambda x: x["date"], reverse=True)
+        preview = items_sorted[:limit]
+
+        await update.message.reply_text(
+            f"📰 *Latest {len(preview)} items from {domain}:*\n_Found {len(items_sorted)} total articles_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        for i, item in enumerate(preview, 1):
+            message = f"*{i}/{len(preview)}*\n{format_news_item(item)}"
+            await update.message.reply_text(
+                message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+            )
+            await asyncio.sleep(0.25)
+
+    # ------------------ Scheduler job ------------------
+    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
+        """Ежедневная проверка всех источников (по расписанию)."""
+        logger.info("Starting scheduled check for all sources...")
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT id, user_id, domain, feed_url, feed_type
+            FROM sources
+            WHERE status = 'active' AND first_sent = TRUE
+            """
+        )
+        sources = cursor.fetchall()
+        logger.info(f"Checking {len(sources)} active sources...")
+
+        for source_id, user_id, domain, feed_url, feed_type in sources:
+            try:
+                items = await fetch_items(feed_url, feed_type)
+                if not items:
+                    continue
+
+                # Кеш уже содержит всё старое, сравниваем по item_id
+                cursor.execute(
+                    "SELECT item_id FROM item_cache WHERE source_id = ?", (source_id,)
+                )
+                cached_ids = {row[0] for row in cursor.fetchall()}
+
+                new_items = [item for item in items if item["id"] not in cached_ids]
+
+                if new_items:
+                    logger.info(f"Found {len(new_items)} new items for {domain}")
+                    new_items.sort(key=lambda x: x["date"])  # отправим по возрастанию
+                    for item in new_items:
+                        await self._notify_new_item(context, user_id, item)
+
+                        # Сохраняем в кеш
+                        try:
+                            cursor.execute(
+                                """
+                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    source_id,
+                                    item["id"],
+                                    item.get("title"),
+                                    item.get("link"),
+                                    item.get("date"),
+                                ),
+                            )
+                        except Exception:
+                            continue
+                        await asyncio.sleep(0.4)
+
+                # Обновляем last_check
+                cursor.execute(
+                    "UPDATE sources SET last_check = ? WHERE id = ?",
+                    (datetime.now(), source_id),
+                )
+
+            except Exception as e:
+                logger.error(f"Error checking source {domain}: {e}")
+
+        conn.commit()
+        conn.close()
+        logger.info("Scheduled check completed.")
+
+    async def _notify_new_item(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, item: Dict
+    ):
+        """Строгое уведомление о новой статье по шаблону."""
+        cat = (item.get("category") or "other").lower()
+        dt = item.get("date") or datetime.now()
+        try:
+            date_str = (
+                dt.strftime("%b %d, %Y %H:%M") if isinstance(dt, datetime) else str(dt)
+            )
+        except Exception:
+            date_str = str(dt)
+
+        msg = (
+            "Я нашёл новую статью для тебя:\n\n"
+            f"📰 *{item.get('title', 'No title')}*\n"
+            f"📅 {date_str}\n"
+            f"🏷️ {CAT_RU.get(cat, 'другое')} ({cat})\n"
+            f"🔗 {item.get('link', '')}"
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+
+    # ------------------ Bot menu (command list) ------------------
     async def _post_init(self, app: Application):
-        """Меню команд Telegram (без /menu, /menu_off, /test)."""
+        """Обновляем список команд в меню клиента Telegram."""
         commands = [
             BotCommand("start", "Запустить бота"),
             BotCommand("list", "Список доменов"),
@@ -394,678 +569,6 @@ class NewsMonitorBot:
         ]
         await app.bot.set_my_commands(commands)
 
-    # ------------------ Scheduler (DAILY @ 12:00 MSK) ------------------
-    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
-        """Ежедневная проверка всех источников (12:00 Europe/Moscow)."""
-        logger.info("Starting daily check for all sources...")
-
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT id, user_id, domain, feed_url, feed_type
-            FROM sources
-            WHERE status = 'active' AND first_sent = TRUE
-        ''')
-        sources = cursor.fetchall()
-        logger.info(f"Checking {len(sources)} active sources...")
-
-        for source_id, user_id, domain, feed_url, feed_type in sources:
-            try:
-                items = await self.fetch_items(feed_url, feed_type)
-                if not items:
-                    continue
-
-                cursor.execute("SELECT item_id FROM item_cache WHERE source_id = ?", (source_id,))
-                cached_ids = {row[0] for row in cursor.fetchall()}
-
-                new_items = [item for item in items if item['id'] not in cached_ids]
-
-                if new_items:
-                    logger.info(f"Found {len(new_items)} new items for {domain}")
-                    new_items.sort(key=lambda x: x['date'])
-                    for item in new_items:
-                        # Отправляем уведомление о НОВОЙ статье
-                        await self._notify_new_item(context, user_id, domain, item)
-
-                        # Кешируем
-                        cursor.execute('''
-                            INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (source_id, item['id'], item['title'], item['link'], item['date']))
-                        await asyncio.sleep(0.4)
-
-                cursor.execute("UPDATE sources SET last_check = ? WHERE id = ?", (datetime.now(), source_id))
-
-            except Exception as e:
-                logger.error(f"Error checking source {domain}: {e}")
-
-        conn.commit()
-        conn.close()
-        logger.info("Daily check completed.")
-
-    async def _notify_new_item(self, context: ContextTypes.DEFAULT_TYPE, user_id: int, domain: str, item: Dict):
-        """Формат уведомления о новой статье (строгий шаблон)."""
-        cat = self.classify_news(item.get("title", ""), item.get("link", ""))
-        dt = item.get("date") or datetime.now()
-        date_str = dt.strftime("%b %d, %Y %H:%M")
-        msg = (
-            "Я нашёл новую статью для тебя:\n\n"
-            f"📰 *{item.get('title', 'No title')}*\n"
-            f"📅 {date_str}\n"
-            f"🏷️ {CAT_RU.get(cat, 'другое')} ({cat})\n"
-            f"🔗 {item.get('link', '')}"
-        )
-        await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-    # ------------------ Feed discovery ------------------
-    async def discover_feed(self, base_url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Ищем сначала RSS/Atom, потом валидный блог/новости (без solutions/pricing…)."""
-        try:
-            parsed = urlparse(base_url)
-            scheme = parsed.scheme or 'https'
-            host = parsed.netloc
-            root = f"{scheme}://{host}"
-
-            # Популярные поддомены + корень
-            subdomains = [
-                'blog', 'news', 'press', 'newsroom', 'media', 'stories', 'source',
-                'about', 'company', 'corporate', 'updates'
-            ]
-            candidate_bases = [root] + [f"{scheme}://{sd}.{host}" for sd in subdomains]
-
-            # 1) <link rel="alternate"> RSS/Atom
-            for base in candidate_bases:
-                try:
-                    r = requests.get(base, timeout=12, headers=DEFAULT_HEADERS)
-                    if r.status_code != 200:
-                        continue
-                    soup = BeautifulSoup(r.content, 'html.parser')
-                    for link in soup.find_all('link', rel='alternate'):
-                        type_attr = (link.get('type') or '').lower()
-                        if any(t in type_attr for t in ['rss', 'atom', 'xml']):
-                            feed_url = urljoin(base, link.get('href'))
-                            feed_type = 'atom' if 'atom' in type_attr else 'rss'
-                            if await self.verify_feed(feed_url):
-                                return feed_url, feed_type
-                except Exception:
-                    continue
-
-            # 2) Общие RSS-пути
-            common_paths = [
-                '/blog/feed', '/blog/rss', '/blog/feed.xml', '/blog/atom.xml', '/blog/index.xml',
-                '/news/feed', '/news/rss', '/news/feed.xml', '/news/atom.xml', '/news/index.xml',
-                '/press/feed', '/press/rss',
-                '/rss', '/rss.xml', '/atom.xml', '/feed', '/feed.xml', '/index.xml',
-            ]
-            for base in candidate_bases:
-                for path in common_paths:
-                    fu = urljoin(base, path)
-                    if await self.verify_feed(fu):
-                        return fu, 'rss'
-
-            # 3) HTML разделы с новостями
-            news_paths = ['/blog', '/news', '/press', '/press-releases', '/newsroom', '/articles', '/stories', '/story', '/updates']
-            banned_paths = list(DEFAULT_BANNED)
-
-            def looks_like_news_url(u: str) -> bool:
-                up = urlparse(u)
-                path = up.path.lower()
-                if any(path == bp or path.startswith(bp + '/') for bp in banned_paths):
-                    return False
-                return any(path == np or path.startswith(np + '/') for np in news_paths)
-
-            ordered_candidates = []
-            for base in candidate_bases:
-                ordered_candidates.append(urljoin(base, '/blog'))
-            for base in candidate_bases:
-                for np in news_paths:
-                    u = urljoin(base, np)
-                    if u not in ordered_candidates:
-                        ordered_candidates.append(u)
-
-            for news_url in ordered_candidates:
-                try:
-                    r = requests.get(news_url, timeout=12, headers=DEFAULT_HEADERS)
-                    if r.status_code != 200:
-                        continue
-                    if not looks_like_news_url(news_url):
-                        continue
-                    soup = BeautifulSoup(r.content, 'html.parser')
-                    candidates = soup.select('article, .post, .blog-post, .news-item, [class*="post"], [class*="article"], [class*="blog"]')
-                    has_titles = 0
-                    for el in candidates[:20]:
-                        t = el.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
-                        a = el.find('a', href=True)
-                        if t and a and len(t.get_text(strip=True)) > 10:
-                            has_titles += 1
-                            if has_titles >= 2:
-                                return news_url, 'html'
-                except Exception:
-                    continue
-
-            # 4) Fallback: корень как HTML
-            try:
-                r = requests.get(root, timeout=10, headers=DEFAULT_HEADERS)
-                if r.status_code == 200:
-                    return root, 'html'
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(f"Error discovering feed for {base_url}: {e}")
-
-        return None, None
-
-    async def verify_feed(self, feed_url: str) -> bool:
-        try:
-            response = requests.get(feed_url, timeout=10, headers=DEFAULT_HEADERS)
-            if response.status_code != 200:
-                return False
-            feed = feedparser.parse(response.content)
-            return len(feed.entries) > 0 and not feed.bozo
-        except Exception:
-            return False
-
-    # ------------------ Date helpers ------------------
-    def _try_parse_date_text(self, text: str) -> Optional[datetime]:
-        text = (text or "").strip()
-        if not text:
-            return None
-        try:
-            return date_parser.parse(text, fuzzy=True, ignoretz=True)
-        except Exception:
-            return None
-
-    def parse_pub_date(self, item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str) -> datetime:
-        """Дата из карточки/листинга."""
-        # 1) <time>
-        time_tag = item_soup.find('time')
-        if time_tag:
-            if time_tag.has_attr('datetime'):
-                dt = self._try_parse_date_text(time_tag['datetime'])
-                if dt:
-                    return dt
-            dt = self._try_parse_date_text(time_tag.get_text(" ", strip=True))
-            if dt:
-                return dt
-
-        # 2) meta на странице листинга
-        meta_names = [
-            ("meta", {"property": "article:published_time"}),
-            ("meta", {"name": "article:published_time"}),
-            ("meta", {"itemprop": "datePublished"}),
-            ("meta", {"property": "og:updated_time"}),
-            ("meta", {"name": "pubdate"}),
-            ("meta", {"name": "publishdate"}),
-            ("meta", {"name": "date"}),
-        ]
-        for tag, attrs in meta_names:
-            m = page_soup.find(tag, attrs=attrs)
-            if m and m.has_attr('content'):
-                dt = self._try_parse_date_text(m['content'])
-                if dt:
-                    return dt
-
-        # 3) типичные классы
-        cand = item_soup.select_one('.date, .post-date, .published, .posted-on, .entry-date, [class*="date"], [class*="time"]')
-        if cand:
-            dt = self._try_parse_date_text(cand.get_text(" ", strip=True))
-            if dt:
-                return dt
-
-        # 4) дата в URL /YYYY/MM/DD/
-        if link:
-            m = re.search(r'/(\d{4})/(\d{2})/(\d{2})(?:/|$)', link)
-            if m:
-                try:
-                    y, mth, d = map(int, m.groups())
-                    return datetime(y, mth, d)
-                except Exception:
-                    pass
-
-        # 5) фолбэк
-        return datetime.now()
-
-    async def extract_date_from_article_page(self, article_url: str) -> datetime:
-        """Уточняем дату публикации со страницы статьи (meta/time/JSON-LD/паттерны)."""
-        try:
-            response = requests.get(article_url, timeout=12, headers=DEFAULT_HEADERS)
-            if response.status_code != 200:
-                return datetime.now()
-
-            soup = BeautifulSoup(response.content, 'html.parser')
-
-            # 1) meta
-            meta_selectors = [
-                'meta[property="article:published_time"]',
-                'meta[name="article:published_time"]',
-                'meta[property="og:published_time"]',
-                'meta[name="publish_date"]',
-                'meta[name="publication_date"]',
-                'meta[name="date"]',
-                'meta[name="created"]'
-            ]
-            for selector in meta_selectors:
-                m = soup.select_one(selector)
-                if m and m.get('content'):
-                    try:
-                        return date_parser.parse(m['content'], ignoretz=True)
-                    except Exception:
-                        pass
-
-            # 2) <time>
-            t = soup.select_one('time[datetime]')
-            if t:
-                try:
-                    return date_parser.parse(t['datetime'], ignoretz=True)
-                except Exception:
-                    pass
-            t2 = soup.find('time')
-            if t2:
-                try:
-                    return date_parser.parse(t2.get_text(' ', strip=True), ignoretz=True)
-                except Exception:
-                    pass
-
-            # 3) JSON-LD
-            for script in soup.find_all('script', type='application/ld+json'):
-                try:
-                    data = script.string or script.text
-                    if not data:
-                        continue
-                    import json
-                    obj = json.loads(data)
-                    candidates = obj if isinstance(obj, list) else [obj]
-                    for c in candidates:
-                        if not isinstance(c, dict):
-                            continue
-                        graph = c.get('@graph')
-                        if isinstance(graph, list):
-                            candidates.extend([g for g in graph if isinstance(g, dict)])
-                        for k in ('datePublished', 'dateCreated', 'uploadDate'):
-                            if k in c and isinstance(c[k], str):
-                                try:
-                                    return date_parser.parse(c[k], ignoretz=True)
-                                except Exception:
-                                    continue
-                except Exception:
-                    continue
-
-            # 4) Паттерны
-            text = soup.get_text(" ", strip=True)
-            patterns = [
-                r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b',
-                r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b',
-                r'\b\d{4}-\d{2}-\d{2}\b',
-                r'\b\d{1,2}/\d{1,2}/\d{4}\b'
-            ]
-            for p in patterns:
-                m = re.search(p, text)
-                if m:
-                    try:
-                        return date_parser.parse(m.group(0), ignoretz=True)
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            logger.debug(f"Error extracting date from {article_url}: {e}")
-
-        return datetime.now()
-
-    # ------------------ Categorization (improved) ------------------
-    # URL-эвристики
-    URL_EVENT_HOSTS  = re.compile(r'(eventbrite|addevent|lu\.ma|hopin|airmeet|tito\.io|meetup\.com)', re.I)
-    URL_EVENT_PATHS  = re.compile(r'/(events?|webinars?|livestreams?)(/|$)', re.I)
-    URL_CASE_PATHS   = re.compile(r'/(case-?stud(y|ies)|customers?|customer-?stories|success-?stories|use-?cases?)(/|$)', re.I)
-    URL_PRODUCT_PATH = re.compile(r'/(releases?|changelog|product-?updates?)(/|$)', re.I)
-
-    CATEGORY_PATTERNS = {
-        "event": re.compile(
-            r"\b(webinar|live\s?stream|livestream|conference|summit|expo|keynote|workshop|meetup|session|panel|talk|booth|roadshow|roundtable|hackathon|agenda|register|rsvp|save\s+the\s+date|join\s+us)\b",
-            re.I,
-        ),
-        "product": re.compile(
-            r"\b(release|launche?s?|update|updated|feature|ga\b|beta\b|preview|sdk|api|integration|now\s+available|introduc|announc|version|v\d+(\.\d+)*)\b",
-            re.I,
-        ),
-        "cases": re.compile(
-            r"\b(case\s?study|customer\s?story|success\s?story|deployment|implementation|rollout|uses\b|adopts|chooses|selects|with\s+[A-Z][A-Za-z0-9&.\- ]+|at\s+[A-Z][A-Za-z0-9&.\- ]+)\b",
-            re.I,
-        ),
-    }
-
-    def classify_news(self, title: str, link: str = "", tags: Optional[List[str]] = None, summary: str = "") -> str:
-        """
-        Возвращает 'event' | 'product' | 'cases' | 'other'.
-        Приоритет: URL-эвристики, затем ключевые слова (event > cases > product).
-        """
-        text_blob = " ".join([title or "", " ".join(tags or []), summary or ""])
-        link_l = (link or "").lower()
-
-        # URL-сигналы
-        if self.URL_EVENT_HOSTS.search(link_l) or self.URL_EVENT_PATHS.search(link_l):
-            return "event"
-        if self.URL_CASE_PATHS.search(link_l):
-            return "cases"
-        if self.URL_PRODUCT_PATH.search(link_l):
-            return "product"
-
-        # По тексту
-        if self.CATEGORY_PATTERNS["event"].search(text_blob):
-            return "event"
-        if self.CATEGORY_PATTERNS["cases"].search(text_blob):
-            return "cases"
-        if self.CATEGORY_PATTERNS["product"].search(text_blob):
-            return "product"
-
-        return "other"
-
-    # ------------------ Fetch items ------------------
-    async def fetch_items(self, feed_url: str, feed_type: str) -> List[Dict]:
-        items: List[Dict] = []
-
-        try:
-            if feed_type in ['rss', 'atom']:
-                response = requests.get(feed_url, timeout=15, headers=DEFAULT_HEADERS)
-                response.raise_for_status()
-                feed = feedparser.parse(response.content)
-                for entry in feed.entries:
-                    pub_date = self.parse_publication_date(entry)
-
-                    # Теги/summary для лучшей категоризации
-                    rss_tags: List[str] = []
-                    if hasattr(entry, "tags") and entry.tags:
-                        for t in entry.tags:
-                            term = (t.get("term") if isinstance(t, dict) else getattr(t, "term", None))
-                            if term:
-                                rss_tags.append(str(term))
-                    summary = entry.get("summary", "") or entry.get("description", "")
-
-                    category = self.classify_news(
-                        entry.get("title", ""),
-                        entry.get("link", ""),
-                        rss_tags,
-                        summary,
-                    )
-
-                    item_id = entry.get('id', entry.get('link', '')) or f"{entry.get('title', '')}_{pub_date.isoformat()}"
-                    items.append({
-                        'id': item_id,
-                        'title': entry.get('title', 'No title'),
-                        'link': entry.get('link', ''),
-                        'date': pub_date,
-                        'category': category,
-                    })
-
-            elif feed_type == 'html':
-                soups = await self._fetch_list_pages_with_pagination(feed_url, max_pages=3)
-                allowed_fragments, banned_fragments = self._fragments_for_domain(self.get_domain_from_url(feed_url))
-
-                found_items = []
-                # 1) карточки
-                for soup in soups:
-                    selectors = [
-                        'article',
-                        '.blog-post', '.post', '.news-item', '.article-item', '.entry',
-                        '.post-item', '.blog-item', '.news-post', '.article-card',
-                        '[class*="post-"]', '[class*="blog-"]', '[class*="article-"]',
-                        '[class*="news-"]', '[class*="entry-"]'
-                    ]
-                    for selector in selectors:
-                        try:
-                            elements = soup.select(selector)
-                            valid_articles = []
-                            for elem in elements:
-                                title_elem = elem.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
-                                link_elem = elem.find('a', href=True)
-                                if not (title_elem and link_elem):
-                                    continue
-                                title_text = title_elem.get_text().strip()
-                                link_href = link_elem.get('href', '')
-                                full = urljoin(feed_url, link_href)
-                                path_lower = urlparse(full).path.lower()
-                                if (
-                                    len(title_text) > 8 and
-                                    any(path_lower == af or path_lower.startswith(af + '/') for af in allowed_fragments) and
-                                    not any(path_lower == bf or path_lower.startswith(bf + '/') for bf in banned_fragments) and
-                                    not any(sk in link_href.lower() for sk in ['mailto:', 'tel:', '#', 'javascript:'])
-                                ):
-                                    valid_articles.append((elem, soup))
-                            if len(valid_articles) >= 2:
-                                found_items.extend(valid_articles)
-                                break
-                        except Exception as e:
-                            logger.debug(f"Selector error {selector}: {e}")
-                            continue
-
-                # 2) план C: все ссылки вида /blog/... и т.п.
-                if len(found_items) < 3:
-                    seen_links = set()
-                    for soup in soups:
-                        for a in soup.select('a[href]'):
-                            href = a.get('href', '')
-                            full = urljoin(feed_url, href)
-                            if full in seen_links:
-                                continue
-                            seen_links.add(full)
-                            path_lower = urlparse(full).path.lower()
-                            if (
-                                any(path_lower == af or path_lower.startswith(af + '/') for af in allowed_fragments) and
-                                not any(path_lower == bf or path_lower.startswith(bf + '/') for bf in banned_fragments) and
-                                not any(sk in href.lower() for sk in ['mailto:', 'tel:', '#', 'javascript:'])
-                            ):
-                                container = a
-                                for _ in range(3):
-                                    if container.parent:
-                                        container = container.parent
-                                found_items.append((container, soup))
-
-                logger.info(f"Processing {len(found_items)} potential articles from HTML pages")
-
-                # 3) оформляем items (уточняем дату со страницы)
-                added = set()
-                for item_node, page_soup in found_items:
-                    try:
-                        a = item_node.find('a', href=True)
-                        if not a:
-                            continue
-                        link = urljoin(feed_url, a['href'])
-                        if link in added:
-                            continue
-                        if 'mailto:' in link or 'tel:' in link or link.endswith('#'):
-                            continue
-
-                        title_elem = item_node.select_one('h1, h2, h3, h4, h5, .title, [class*="title"], [class*="headline"]')
-                        title = ''
-                        if title_elem:
-                            title = title_elem.get_text(' ', strip=True)
-                        if not title:
-                            title = a.get_text(' ', strip=True)
-                        title = re.sub(r'\s+', ' ', title).strip()
-                        if len(title) < 5:
-                            continue
-
-                        pub_date = self.parse_pub_date(item_node, page_soup, link)
-                        precise = await self.extract_date_from_article_page(link)
-                        if precise:
-                            pub_date = precise
-
-                        category = self.classify_news(title, link)
-
-                        items.append({
-                            'id': link,
-                            'title': title[:200],
-                            'link': link,
-                            'date': pub_date,
-                            'category': category,
-                        })
-                        added.add(link)
-
-                        if len(items) >= 40:
-                            break
-                    except Exception as e:
-                        logger.debug(f"Error parsing HTML item: {e}")
-                        continue
-
-        except Exception as e:
-            logger.error(f"Error fetching items from {feed_url}: {e}")
-
-        logger.info(f"Successfully parsed {len(items)} items")
-        return items
-
-    def _fragments_for_domain(self, domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        rules = DOMAIN_RULES.get(domain, {})
-        allow = rules.get("allow", DEFAULT_ALLOWED)
-        ban = rules.get("ban", DEFAULT_BANNED)
-        return allow, ban
-
-    async def _fetch_list_pages_with_pagination(self, start_url: str, max_pages: int = 3) -> List[BeautifulSoup]:
-        """Загружаем страницу списка + до 2 следующих (rel=next, /page/2, ?page=2 ...)"""
-        soups: List[BeautifulSoup] = []
-        visited = set()
-        current = start_url
-
-        for _ in range(max_pages):
-            if not current or current in visited:
-                break
-            visited.add(current)
-            try:
-                r = requests.get(current, timeout=12, headers=DEFAULT_HEADERS)
-                if r.status_code != 200:
-                    break
-                soup = BeautifulSoup(r.content, 'html.parser')
-                soups.append(soup)
-
-                # ищем next
-                next_link = None
-                link_tag = soup.find('link', rel=lambda v: v and 'next' in v.lower())
-                if link_tag and link_tag.get('href'):
-                    next_link = urljoin(current, link_tag['href'])
-
-                if not next_link:
-                    a_next = soup.find('a', rel=lambda v: v and 'next' in v.lower())
-                    if a_next and a_next.get('href'):
-                        next_link = urljoin(current, a_next['href'])
-
-                if not next_link:
-                    # эвристики: /page/2, /page/3
-                    m = re.search(r'(.*?/page/)(\d+)/?$', current)
-                    if m:
-                        base, num = m.group(1), int(m.group(2))
-                        next_link = base + str(num + 1)
-                    else:
-                        # ?page=2
-                        if '?' in current:
-                            if re.search(r'([?&])page=(\d+)', current):
-                                next_link = re.sub(r'([?&])page=(\d+)', lambda m: f"{m.group(1)}page={int(m.group(2)) + 1}", current)
-                            else:
-                                next_link = current + "&page=2"
-                        else:
-                            next_link = current.rstrip('/') + '/page/2'
-
-                if urlparse(next_link).netloc and (self.get_domain_from_url(next_link) != self.get_domain_from_url(start_url)):
-                    break
-
-                current = next_link
-            except Exception as e:
-                logger.debug(f"Pagination fetch error: {e}")
-                break
-
-        return soups
-
-    def parse_publication_date(self, entry) -> datetime:
-        """Дата для RSS/Atom entry."""
-        date_fields = ['published_parsed', 'updated_parsed', 'created_parsed']
-        for field in date_fields:
-            if hasattr(entry, field) and getattr(entry, field):
-                try:
-                    parsed_time = getattr(entry, field)
-                    return datetime(*parsed_time[:6])
-                except Exception:
-                    continue
-
-        string_fields = ['published', 'updated', 'created', 'pubDate']
-        for field in string_fields:
-            if hasattr(entry, field) and getattr(entry, field):
-                try:
-                    date_str = getattr(entry, field)
-                    return date_parser.parse(date_str, ignoretz=True)
-                except Exception:
-                    continue
-
-        return datetime.now()
-
-    def format_news_item(self, item: Dict) -> str:
-        """Формат карточки новости для сообщений списка/initial."""
-        pub_date = item['date']
-        now = datetime.now()
-        days_diff = (now.date() - pub_date.date()).days
-
-        if days_diff == 0:
-            date_str = f"Today {pub_date.strftime('%H:%M')}"
-        elif days_diff == 1:
-            date_str = f"Yesterday {pub_date.strftime('%H:%M')}"
-        elif days_diff < 7:
-            date_str = pub_date.strftime("%A %H:%M")
-        else:
-            date_str = pub_date.strftime("%b %d, %Y %H:%M")
-
-        title = item['title']
-        if len(title) > 120:
-            title = title[:117] + "…"
-
-        tag = (item.get('category') or 'other').lower()
-        tag_emoji = CAT_EMOJI.get(tag, '🏷️')
-
-        return f"{tag_emoji} *{title}*\n📅 {date_str}\n🏷️ {tag}\n🔗 {item['link']}\n"
-
-    # ------------------ Initial send ------------------
-    async def send_initial_items(self, update: Update, source_id: int):
-        """При добавлении домена — присылаем последние 3 поста и сразу кешируем."""
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            cursor = conn.cursor()
-
-            cursor.execute("SELECT feed_url, feed_type, domain FROM sources WHERE id = ?", (source_id,))
-            result = cursor.fetchone()
-            if not result:
-                return
-
-            feed_url, feed_type, domain = result
-            items = await self.fetch_items(feed_url, feed_type)
-            if not items:
-                await update.message.reply_text(f"📭 No recent items found for {domain}")
-                conn.close()
-                return
-
-            items.sort(key=lambda x: x['date'], reverse=True)
-            recent_items = items[:3]
-
-            await update.message.reply_text(
-                f"📰 *Latest {len(recent_items)} items from {domain}:*\n_Found {len(items)} total articles_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-            for i, item in enumerate(recent_items, 1):
-                message = f"*{i}/{len(recent_items)}*\n{self.format_news_item(item)}"
-                await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-                cursor.execute('''
-                    INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (source_id, item['id'], item['title'], item['link'], item['date']))
-
-                await asyncio.sleep(0.3)
-
-            cursor.execute("UPDATE sources SET first_sent = TRUE, last_check = ? WHERE id = ?",
-                           (datetime.now(), source_id))
-            conn.commit()
-            conn.close()
-
-        except Exception:
-            logger.exception("Error sending initial items")
-
     # ------------------ Runner ------------------
     def run(self):
         app = Application.builder().token(self.token).build()
@@ -1077,38 +580,46 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("remove", self.remove_source))
         app.add_handler(CommandHandler("favourites", self.favourites))
 
-        # Категории: строго одна категория, добавлены синонимы
-        app.add_handler(CommandHandler(["event", "events"], self.event_cmd))
-        app.add_handler(CommandHandler(["cases", "case"], self.cases_cmd))
+        # Категории
+        app.add_handler(CommandHandler("event", self.event_cmd))
         app.add_handler(CommandHandler("product", self.product_cmd))
+        app.add_handler(CommandHandler("cases", self.cases_cmd))
         app.add_handler(CommandHandler("other", self.other_cmd))
 
         # Команды в меню Telegram
         app.post_init = self._post_init
 
-        # ⏰ ЕЖЕДНЕВНЫЙ ЗАПУСК В 12:00 ПО МОСКВЕ
+        # ⏰ ЕЖЕДНЕВНЫЙ ЗАПУСК В 12:00 ПО МОСКВЕ (по config)
+        tz = ZoneInfo(SCHEDULE_TZ)
         job_queue = app.job_queue
         if job_queue:
-            msk = ZoneInfo("Europe/Moscow")
             job_queue.run_daily(
                 self.periodic_check,
-                time=dt_time(hour=12, minute=0, tzinfo=msk),
-                name="daily_news_check_moscow_noon",
+                time=dtime(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, tzinfo=tz),
+                name="daily_news_check",
             )
-            logger.info("Scheduled daily check at 12:00 Europe/Moscow")
+            logger.info(
+                f"Scheduled daily check at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}"
+            )
         else:
-            logger.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
+            logger.warning(
+                "JobQueue is not available. Install python-telegram-bot[job-queue]."
+            )
 
         print("🤖 News Monitor Bot is starting...")
-        print("⏰ Daily checks at 12:00 (Europe/Moscow)")
+        print(f"⏰ Daily checks at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} ({SCHEDULE_TZ})")
         print("💾 Database:", self.db_path)
 
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 # ======================== MAIN ===========================
-if __name__ == '__main__':
-    # Токен лучше хранить в переменной окружения BOT_TOKEN или TELEGRAM_BOT_TOKEN
-    BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+if __name__ == "__main__":
+    # Токен берём из переменной окружения
+    BOT_TOKEN = (
+        os.getenv("BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
+        or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+    )
     bot = NewsMonitorBot(BOT_TOKEN)
     bot.run()
