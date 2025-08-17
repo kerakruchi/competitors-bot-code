@@ -3,7 +3,7 @@ import asyncio
 import sqlite3
 import logging
 from datetime import datetime, time as dtime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 
 from zoneinfo import ZoneInfo
 from telegram import Update, BotCommand
@@ -81,6 +81,20 @@ class NewsMonitorBot:
                 FOREIGN KEY (source_id) REFERENCES sources (id),
                 UNIQUE(source_id, item_id)
             )
+        """
+        )
+
+        # Индексы для ускорения
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_item_cache_source_pub
+            ON item_cache (source_id, pub_date DESC)
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_item_cache_source_item
+            ON item_cache (source_id, item_id)
         """
         )
 
@@ -259,11 +273,12 @@ class NewsMonitorBot:
                 last_check_str = "Never"
             else:
                 try:
-                    last_check_str = (
+                    last_dt = (
                         datetime.fromisoformat(last_check)
                         if isinstance(last_check, str)
                         else last_check
-                    ).strftime("%m-%d %H:%M")
+                    )
+                    last_check_str = last_dt.strftime("%m-%d %H:%M")
                 except Exception:
                     last_check_str = str(last_check)
             message += f"{i}. {status_emoji} *{domain}*\n"
@@ -345,7 +360,6 @@ class NewsMonitorBot:
             except Exception:
                 dt = datetime.now()
             date_str = dt.strftime("%b %d, %Y")
-            # эмодзи берётся внутри компактного форматтера — тут простая карточка:
             lines.append(f"*{title}*\n📅 {date_str}\n🔗 {link}\n")
 
         await update.message.reply_text(
@@ -529,8 +543,17 @@ class NewsMonitorBot:
     async def _notify_new_item(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int, item: Dict
     ):
-        """Строгое уведомление о новой статье по шаблону."""
-        cat = (item.get("category") or "other").lower()
+        """Строгое уведомление о новой статье по шаблону.
+        Если категория не передана — классифицируем на лету.
+        """
+        cat = (item.get("category") or "").lower()
+        if not cat:
+            try:
+                from newsbot.classify import classify_news
+                cat = classify_news(item.get("title", ""), item.get("link", ""))
+            except Exception:
+                cat = "other"
+
         dt = item.get("date") or datetime.now()
         try:
             date_str = (
