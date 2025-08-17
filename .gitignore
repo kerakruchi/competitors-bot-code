@@ -1,3 +1,24 @@
+# Python
 __pycache__/
-.env
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+dist/
+.eggs/
+
+# Venv
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Local data
 news_monitor.db
+.env
