@@ -1,16 +1,34 @@
 # newsbot/config.py
-import os
 from typing import Dict, Tuple
 
-# ---------- База данных ----------
-DB_PATH = os.getenv("DB_PATH", "news_monitor.db")
+# ===================== База и расписание =====================
+DB_PATH: str = "news_monitor.db"
 
-# ---------- Расписание (по умолчанию: каждый день в 12:00 Europe/Moscow) ----------
-SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/Moscow")
-SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "12"))
-SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
+# Ежедневная проверка (время локали Telegram JobQueue берём из zoneinfo)
+SCHEDULE_TZ: str = "Europe/Moscow"
+SCHEDULE_HOUR: int = 12
+SCHEDULE_MINUTE: int = 0
 
-# ---------- Пер-доменные правила (что считать новостями) ----------
+# ===================== HTTP заголовки =====================
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; NewsMonitorBot/1.5)"
+}
+
+# ===================== Фильтры путей ======================
+# Разрешённые/запрещённые фрагменты путей для HTML-поиска статей
+DEFAULT_ALLOWED: Tuple[str, ...] = (
+    "/blog", "/news", "/press", "/press-releases", "/newsroom",
+    "/articles", "/story", "/stories", "/updates",
+    # добавили «ивентные» разделы
+    "/events", "/event", "/calendar", "/webinars", "/talks",
+)
+
+DEFAULT_BANNED: Tuple[str, ...] = (
+    "/solutions", "/solution", "/product", "/products",
+    "/pricing", "/careers", "/docs", "/documentation",
+)
+
+# Возможность переопределить правила для доменов
 DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "spot.ai": {
         "allow": ("/blog",),
@@ -24,37 +42,14 @@ DOMAIN_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
         "allow": ("/news", "/blog"),
         "ban": (),
     },
+    # События Яндекса — это календарь мероприятий, не блог
+    "events.yandex.ru": {
+        "allow": ("/", "/events", "/event", "/calendar", "/webinars", "/talks"),
+        "ban": (),
+    },
 }
 
-# Общие разрешённые/запрещённые фрагменты путей
-DEFAULT_ALLOWED: Tuple[str, ...] = (
-    "/blog",
-    "/news",
-    "/press",
-    "/press-releases",
-    "/newsroom",
-    "/articles",
-    "/story",
-    "/stories",
-    "/updates",
-)
-DEFAULT_BANNED: Tuple[str, ...] = (
-    "/solutions",
-    "/solution",
-    "/product",
-    "/products",
-    "/pricing",
-    "/careers",
-    "/docs",
-    "/documentation",
-)
-
-# ---------- HTTP заголовки для запросов ----------
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewsMonitorBot/1.4; +https://example.com/bot)"
-}
-
-# ---------- Карты категорий и эмодзи ----------
+# ===================== Карты категорий =====================
 CAT_RU = {
     "event": "ивент",
     "product": "продукт",
