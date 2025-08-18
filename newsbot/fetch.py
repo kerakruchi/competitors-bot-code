@@ -27,7 +27,10 @@ def get_domain_from_url(u: str) -> str:
 
 
 def normalize_url(url: str) -> Tuple[str, str]:
-    """Вернёт (normalized_url, domain). Если дан путь вроде /blog — оставим только корневой раздел."""
+    """
+    Вернёт (normalized_url, domain).
+    Если дан путь вроде /blog — оставим только корневой раздел.
+    """
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
@@ -50,8 +53,9 @@ def normalize_url(url: str) -> Tuple[str, str]:
 # ================== Feed discovery ==================
 async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Сначала ищем RSS/Atom (<link rel="alternate">, типичные пути). Если не нашли — возвращаем
-    валидную HTML-страницу раздела новостей/блога; в крайнем случае — корень сайта.
+    Сначала ищем RSS/Atom (<link rel="alternate">, типичные пути).
+    Если не нашли — возвращаем валидную HTML-страницу раздела новостей/блога.
+    В крайнем случае — корень сайта.
     """
     try:
         parsed = urlparse(base_url)
@@ -98,7 +102,7 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
         # 3) HTML разделы новостей/блога
         news_paths = [
             "/blog", "/news", "/press", "/press-releases", "/newsroom",
-            "/articles", "/stories", "/story", "/updates", "/events"
+            "/articles", "/stories", "/story", "/updates", "/events",
         ]
         banned_paths = list(DEFAULT_BANNED)
 
@@ -282,7 +286,7 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
                     graph = c.get("@graph")
                     if isinstance(graph, list):
                         candidates.extend([g for g in graph if isinstance(g, dict)])
-                    # Event-ключи
+                    # Event/Article ключи
                     for k in ("datePublished", "dateCreated", "uploadDate", "startDate"):
                         if k in c and isinstance(c[k], str):
                             try:
@@ -421,7 +425,7 @@ def _iter_dicts(obj: Any):
 def _extract_items_from_inline_json(soup: BeautifulSoup, base_url: str) -> List[Dict]:
     """
     Пытаемся достать события/посты из JSON внутри страницы:
-    - JSON-LD Event (на листинге)
+    - JSON-LD Event/Article (на листинге)
     - Next.js __NEXT_DATA__
     - Любые объекты, где есть (title|name) + (url|slug) и startDate|datePublished
     """
@@ -455,39 +459,29 @@ def _extract_items_from_inline_json(soup: BeautifulSoup, base_url: str) -> List[
         except Exception:
             continue
 
-    # 2) Next.js/любой inline JSON
+    # 2) Next.js/любой «толстый» inline JSON (в т.ч. __NEXT_DATA__)
     possible_scripts = soup.find_all("script")
     for sc in possible_scripts:
-        # Ищем __NEXT_DATA__ или достаточно «толстые» JSON
-        attr_texts = [
-            sc.get("id") or "",
-            sc.get("type") or "",
-        ]
         text = sc.string or sc.text or ""
         cond_next = (sc.get("id") == "__NEXT_DATA__") or ("__NEXT_DATA__" in text)
         cond_json_like = ("{" in text and "}" in text and len(text) > 2000)
         if not (cond_next or cond_json_like):
             continue
         try:
-            # В некоторых случаях там может быть JS, пробуем выдернуть JSON «по скобкам»
             raw = text.strip()
-            # Небезошибочно, но часто срабатывает
             start = raw.find("{")
             end = raw.rfind("}")
             if start == -1 or end == -1 or end <= start:
                 continue
-            data = json.loads(raw[start:end+1])
+            data = json.loads(raw[start:end + 1])
         except Exception:
             continue
 
-        # Ищем узлы с (title|name) + (url|slug) + (startDate|datePublished)
         for node in _iter_dicts(data):
             name = node.get("name") or node.get("title")
             url = node.get("url") or node.get("slug")
-            # Иногда url хранится как {"pathname": "/events/..."}
             if isinstance(url, dict):
                 url = url.get("pathname") or url.get("path") or url.get("href")
-            # Дата
             start_date = node.get("startDate") or node.get("datePublished") or node.get("dateCreated") or node.get("date")
 
             if name and (url or start_date):
@@ -557,7 +551,6 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
             # ДОПОЛНИТЕЛЬНЫЕ ХАБЫ для обходных доменов (например, events.yandex.ru)
             if bypass:
                 extra_hubs = ["/events", "/event", "/conf", "/conference"]
-                # не дублируем уже загруженное
                 seen_html = {soup.decode()[:200] for soup in soups}
                 for hub in extra_hubs:
                     try:
@@ -620,7 +613,6 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
 
                             found_items.append((elem, soup))
                             local_found += 1
-                        # если нашли хоть что-то по этому селектору — хватит
                         if local_found >= 2:
                             break
                     except Exception:
@@ -651,7 +643,7 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                             True if bypass else not any(path_lower == bf or path_lower.startswith(bf + "/") for bf in banned_fragments)
                         )
 
-                        # Доп. правило для событий: явно разрешаем /events/... и /event/...
+                        # Явно позволяем /events/... и /event/...
                         looks_like_event = path_lower.startswith("/events") or path_lower.startswith("/event")
 
                         if (cond_allowed and cond_banned) or looks_like_event:
@@ -664,11 +656,10 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                                     container = container.parent
                             found_items.append((container, soup))
 
-            # 2a) Пытаемся выдернуть элементы из inline JSON (JSON-LD/Event, __NEXT_DATA__)
+            # 2a) Попытка достать элементы из inline JSON (JSON-LD/Event, __NEXT_DATA__)
             if len(found_items) == 0:
                 for soup in soups:
                     inline_items = _extract_items_from_inline_json(soup, feed_url)
-                    # inline_items уже полноценные items — сразу добавим
                     items.extend(inline_items)
 
             # 3) Сформировать items из найденных контейнеров
@@ -710,3 +701,15 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                         "link": link,
                         "date": pub_date,
                         "category": category,
+                    })
+                    added.add(link)
+
+                    if len(items) >= 60:
+                        break
+                except Exception:
+                    continue
+
+    except Exception:
+        pass
+
+    return items
