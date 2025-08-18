@@ -1,7 +1,9 @@
+# bot.py
 import os
 import asyncio
 import sqlite3
 import logging
+from html import escape
 from datetime import datetime, time as dtime
 from typing import List, Dict
 
@@ -24,8 +26,8 @@ from newsbot.fetch import (
     fetch_items,
 )
 from newsbot.formatting import (
-    format_news_item,
-    _format_compact_line,
+    format_news_item,       # теперь возвращает HTML
+    _format_compact_line,   # теперь возвращает HTML
 )
 
 # ------------------------- Logging -------------------------
@@ -84,20 +86,6 @@ class NewsMonitorBot:
         """
         )
 
-        # Индексы для ускорения
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_item_cache_source_pub
-            ON item_cache (source_id, pub_date DESC)
-        """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_item_cache_source_item
-            ON item_cache (source_id, item_id)
-        """
-        )
-
         # Избранное (опционально)
         cursor.execute(
             """
@@ -124,27 +112,28 @@ class NewsMonitorBot:
         hh = SCHEDULE_HOUR
         mm = SCHEDULE_MINUTE
         welcome_message = (
-            "🤖 *Welcome to News Monitor Bot!*\n\n"
+            "🤖 <b>Welcome to News Monitor Bot!</b>\n\n"
             "Я помогу мониторить новости компаний и присылать новые посты.\n\n"
-            "*Команды:*\n"
-            "• `/start` — запустить бота\n"
-            "• `/list` — список доменов\n"
-            "• `/add <url>` — добавить домен\n"
-            "• `/remove <domain>` — удалить домен\n"
-            "• `/favourites` — показать избранные\n"
-            "• `/event` — только ивенты\n"
-            "• `/product` — про продукты\n"
-            "• `/cases` — кейсы\n"
-            "• `/other` — другое\n\n"
-            f"⏰ Автопроверка: *каждый день в {hh:02d}:{mm:02d} ({tz}).*"
+            "<b>Команды:</b>\n"
+            "• <code>/start</code> — запустить бота\n"
+            "• <code>/list</code> — список доменов\n"
+            "• <code>/add &lt;url&gt;</code> — добавить домен\n"
+            "• <code>/remove &lt;domain&gt;</code> — удалить домен\n"
+            "• <code>/favourites</code> — показать избранные\n"
+            "• <code>/event</code> — только ивенты\n"
+            "• <code>/product</code> — про продукты\n"
+            "• <code>/cases</code> — кейсы\n"
+            "• <code>/other</code> — другое\n\n"
+            f"⏰ Автопроверка: <b>каждый день в {hh:02d}:{mm:02d} ({escape(tz)})</b>."
         )
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
 
     async def add_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text(
-                "Usage: /add <company_website_url>\n\nExample:\n`/add https://microsoft.com`\n`/add techcrunch.com`",
-                parse_mode=ParseMode.MARKDOWN,
+                "Usage: <code>/add &lt;company_website_url&gt;</code>\n\n"
+                "Example:\n<code>/add https://microsoft.com</code>\n<code>/add techcrunch.com</code>",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -162,19 +151,22 @@ class NewsMonitorBot:
             )
             if cursor.fetchone():
                 await update.message.reply_text(
-                    f"❌ {domain} is already being monitored."
+                    f"❌ {escape(domain)} is already being monitored.",
+                    parse_mode=ParseMode.HTML,
                 )
                 conn.close()
                 return
 
             await update.message.reply_text(
-                f"🔍 Analyzing {domain}... Looking for news feeds..."
+                f"🔍 Analyzing {escape(domain)}... Looking for news feeds...",
+                parse_mode=ParseMode.HTML,
             )
 
             feed_url, feed_type = await discover_feed(normalized_url)
             if not feed_url:
                 await update.message.reply_text(
-                    f"❌ Could not find a news feed for {domain}"
+                    f"❌ Could not find a news feed for {escape(domain)}",
+                    parse_mode=ParseMode.HTML,
                 )
                 conn.close()
                 return
@@ -219,9 +211,10 @@ class NewsMonitorBot:
             hh = SCHEDULE_HOUR
             mm = SCHEDULE_MINUTE
             await update.message.reply_text(
-                f"✅ Added {domain}. Monitoring started.\n"
-                f"📡 Feed type: {feed_type.upper()}\n"
-                f"⏰ Daily checks at {hh:02d}:{mm:02d} ({tz})"
+                f"✅ Added {escape(domain)}. Monitoring started.<br>"
+                f"📡 Feed type: <b>{escape(feed_type.upper())}</b><br>"
+                f"⏰ Daily checks at <b>{hh:02d}:{mm:02d} ({escape(tz)})</b>",
+                parse_mode=ParseMode.HTML,
             )
 
             # Отправляем только 3 последних карточки (но в кеш уже положили все)
@@ -239,7 +232,10 @@ class NewsMonitorBot:
 
         except Exception as e:
             logger.exception("Error adding source")
-            await update.message.reply_text(f"❌ Error adding source: {str(e)}")
+            await update.message.reply_text(
+                f"❌ Error adding source: {escape(str(e))}",
+                parse_mode=ParseMode.HTML,
+            )
 
     async def list_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -259,12 +255,12 @@ class NewsMonitorBot:
 
         if not sources:
             await update.message.reply_text(
-                "📭 No sources being monitored.\n\nUse `/add <url>` to start monitoring a website!",
-                parse_mode=ParseMode.MARKDOWN,
+                "📭 No sources being monitored.\n\nUse <code>/add &lt;url&gt;</code> to start monitoring a website!",
+                parse_mode=ParseMode.HTML,
             )
             return
 
-        message = "📊 *Your Monitored Sources:*\n\n"
+        message = "📊 <b>Your Monitored Sources:</b>\n\n"
         for i, (domain, status, feed_type, last_check, created_at) in enumerate(
             sources, 1
         ):
@@ -273,25 +269,25 @@ class NewsMonitorBot:
                 last_check_str = "Never"
             else:
                 try:
-                    last_dt = (
+                    last_check_dt = (
                         datetime.fromisoformat(last_check)
                         if isinstance(last_check, str)
                         else last_check
                     )
-                    last_check_str = last_dt.strftime("%m-%d %H:%M")
+                    last_check_str = last_check_dt.strftime("%m-%d %H:%M")
                 except Exception:
                     last_check_str = str(last_check)
-            message += f"{i}. {status_emoji} *{domain}*\n"
-            message += f"   📡 Type: {feed_type.upper()}\n"
-            message += f"   🕒 Last check: {last_check_str}\n\n"
+            message += f"{i}. {status_emoji} <b>{escape(domain)}</b>\n"
+            message += f"   📡 Type: {escape(feed_type.upper())}\n"
+            message += f"   🕒 Last check: {escape(last_check_str)}\n\n"
 
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
     async def remove_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text(
-                "Usage: /remove <domain>\n\nExample:\n`/remove microsoft.com`",
-                parse_mode=ParseMode.MARKDOWN,
+                "Usage: <code>/remove &lt;domain&gt;</code>\n\nExample:\n<code>/remove microsoft.com</code>",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -311,8 +307,8 @@ class NewsMonitorBot:
 
         if not result:
             await update.message.reply_text(
-                f"❌ Domain `{domain}` not found in your monitored sources.\n\nUse `/list` to see your sources.",
-                parse_mode=ParseMode.MARKDOWN,
+                f"❌ Domain <code>{escape(domain)}</code> not found in your monitored sources.\n\nUse <code>/list</code> to see your sources.",
+                parse_mode=ParseMode.HTML,
             )
             conn.close()
             return
@@ -324,7 +320,8 @@ class NewsMonitorBot:
         conn.close()
 
         await update.message.reply_text(
-            f"✅ Removed `{domain}` from monitoring.", parse_mode=ParseMode.MARKDOWN
+            f"✅ Removed <code>{escape(domain)}</code> from monitoring.",
+            parse_mode=ParseMode.HTML,
         )
 
     async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,7 +346,7 @@ class NewsMonitorBot:
             await update.message.reply_text("⭐️ Избранных пока нет.")
             return
 
-        lines = ["⭐️ *Избранные материалы:*"]
+        lines = ["⭐️ <b>Избранные материалы:</b>"]
         for title, link, pub_date, category, domain in rows:
             try:
                 dt = (
@@ -360,10 +357,10 @@ class NewsMonitorBot:
             except Exception:
                 dt = datetime.now()
             date_str = dt.strftime("%b %d, %Y")
-            lines.append(f"*{title}*\n📅 {date_str}\n🔗 {link}\n")
+            lines.append(f"<b>{escape(title)}</b>\n📅 {escape(date_str)}\n🔗 <a href=\"{escape(link, quote=True)}\">{escape(link)}</a>\n")
 
         await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+            "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
     # --- Команды категорий: показываем ТОЛЬКО выбранную категорию ---
@@ -434,12 +431,12 @@ class NewsMonitorBot:
             "cases": "Новости про кейсы",
             "other": "Другие новости",
         }
-        lines = [f"*{title_map.get(category, 'Новости')}*"]
+        lines = [f"<b>{escape(title_map.get(category, 'Новости'))}</b>"]
         for it in items:
             lines.append(_format_compact_line(it))
 
         await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+            "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
     # ------------------ Initial preview ------------------
@@ -452,21 +449,24 @@ class NewsMonitorBot:
     ):
         """Отправляем только превью из N карточек (кеш уже заполнен ранее)."""
         if not items:
-            await update.message.reply_text(f"📭 No recent items found for {domain}")
+            await update.message.reply_text(
+                f"📭 No recent items found for {escape(domain)}",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         items_sorted = sorted(items, key=lambda x: x["date"], reverse=True)
         preview = items_sorted[:limit]
 
         await update.message.reply_text(
-            f"📰 *Latest {len(preview)} items from {domain}:*\n_Found {len(items_sorted)} total articles_",
-            parse_mode=ParseMode.MARKDOWN,
+            f"📰 <b>Latest {len(preview)} items from {escape(domain)}:</b>\n<i>Found {len(items_sorted)} total articles</i>",
+            parse_mode=ParseMode.HTML,
         )
 
         for i, item in enumerate(preview, 1):
-            message = f"*{i}/{len(preview)}*\n{format_news_item(item)}"
+            message = f"<b>{i}/{len(preview)}</b>\n{format_news_item(item)}"
             await update.message.reply_text(
-                message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+                message, parse_mode=ParseMode.HTML, disable_web_page_preview=True
             )
             await asyncio.sleep(0.25)
 
@@ -543,17 +543,8 @@ class NewsMonitorBot:
     async def _notify_new_item(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int, item: Dict
     ):
-        """Строгое уведомление о новой статье по шаблону.
-        Если категория не передана — классифицируем на лету.
-        """
-        cat = (item.get("category") or "").lower()
-        if not cat:
-            try:
-                from newsbot.classify import classify_news
-                cat = classify_news(item.get("title", ""), item.get("link", ""))
-            except Exception:
-                cat = "other"
-
+        """Строгое уведомление о новой статье по шаблону (HTML + экранирование)."""
+        cat = (item.get("category") or "other").lower()
         dt = item.get("date") or datetime.now()
         try:
             date_str = (
@@ -562,17 +553,21 @@ class NewsMonitorBot:
         except Exception:
             date_str = str(dt)
 
+        title_html = escape(item.get("title", "No title"))
+        link = item.get("link", "")
+        link_html = escape(link, quote=True)
+
         msg = (
             "Я нашёл новую статью для тебя:\n\n"
-            f"📰 *{item.get('title', 'No title')}*\n"
-            f"📅 {date_str}\n"
-            f"🏷️ {CAT_RU.get(cat, 'другое')} ({cat})\n"
-            f"🔗 {item.get('link', '')}"
+            f"📰 <b>{title_html}</b>\n"
+            f"📅 {escape(date_str)}\n"
+            f"🏷️ {escape(CAT_RU.get(cat, 'другое'))} ({escape(cat)})\n"
+            f"🔗 <a href=\"{link_html}\">{escape(link)}</a>"
         )
         await context.bot.send_message(
             chat_id=user_id,
             text=msg,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
 
@@ -602,47 +597,3 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("list", self.list_sources))
         app.add_handler(CommandHandler("remove", self.remove_source))
         app.add_handler(CommandHandler("favourites", self.favourites))
-
-        # Категории
-        app.add_handler(CommandHandler("event", self.event_cmd))
-        app.add_handler(CommandHandler("product", self.product_cmd))
-        app.add_handler(CommandHandler("cases", self.cases_cmd))
-        app.add_handler(CommandHandler("other", self.other_cmd))
-
-        # Команды в меню Telegram
-        app.post_init = self._post_init
-
-        # ⏰ ЕЖЕДНЕВНЫЙ ЗАПУСК В 12:00 ПО МОСКВЕ (по config)
-        tz = ZoneInfo(SCHEDULE_TZ)
-        job_queue = app.job_queue
-        if job_queue:
-            job_queue.run_daily(
-                self.periodic_check,
-                time=dtime(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, tzinfo=tz),
-                name="daily_news_check",
-            )
-            logger.info(
-                f"Scheduled daily check at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}"
-            )
-        else:
-            logger.warning(
-                "JobQueue is not available. Install python-telegram-bot[job-queue]."
-            )
-
-        print("🤖 News Monitor Bot is starting...")
-        print(f"⏰ Daily checks at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} ({SCHEDULE_TZ})")
-        print("💾 Database:", self.db_path)
-
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-# ======================== MAIN ===========================
-if __name__ == "__main__":
-    # Токен берём из переменной окружения
-    BOT_TOKEN = (
-        os.getenv("BOT_TOKEN")
-        or os.getenv("TELEGRAM_BOT_TOKEN")
-        or "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-    )
-    bot = NewsMonitorBot(BOT_TOKEN)
-    bot.run()
