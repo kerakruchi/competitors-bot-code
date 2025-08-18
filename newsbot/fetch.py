@@ -1,53 +1,34 @@
 # newsbot/fetch.py
-"""
-Поиск фидов и сбор новостей (RSS/Atom/HTML) + хелперы дат и пагинации.
-Возвращаем элементы в формате:
-{
-    'id': str,
-    'title': str,
-    'link': str,
-    'date': datetime,
-    'category': 'event'|'product'|'cases'|'other'
-}
-"""
-
-from __future__ import annotations
-
-import json
-import logging
 import re
+import json
+import requests
+import feedparser
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-import feedparser
-import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
-from .config import (
+from newsbot.config import (
     DEFAULT_HEADERS,
+    DOMAIN_RULES,
     DEFAULT_ALLOWED,
     DEFAULT_BANNED,
-    DOMAIN_RULES,
 )
-from .classify import classify_news
-
-logger = logging.getLogger(__name__)
+from newsbot.classify import classify_news
 
 
-# ------------------ URL helpers ------------------
+# ================ utils: url/domain =================
 def get_domain_from_url(u: str) -> str:
-    """Вернуть домен без www."""
     netloc = urlparse(u).netloc.lower()
     return netloc[4:] if netloc.startswith("www.") else netloc
 
 
 def normalize_url(url: str) -> Tuple[str, str]:
     """
-    Нормализовать URL и вернуть (normalized_url, host).
-    - Если введён просто домен → вернём корень (scheme://host)
-    - Если путь похож на раздел новостей (blog/news/press/...) → сохраним только корень раздела
+    Нормализуем URL и выделяем домен.
+    Если путь указывает на новостной/блоговый/ивентный раздел — оставляем этот раздел.
     """
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -61,14 +42,10 @@ def normalize_url(url: str) -> Tuple[str, str]:
 
     path = (parsed.path or "").strip("/")
     news_roots = (
-        "blog",
-        "news",
-        "press",
-        "newsroom",
-        "articles",
-        "media",
-        "stories",
-        "updates",
+        "blog", "news", "press", "newsroom", "articles", "media",
+        "stories", "updates",
+        # добавили ивентные корни
+        "events", "event", "calendar", "webinars", "talks",
     )
     if path and path.split("/")[0].lower() in news_roots:
         normalized_url = f"{root}/{path.split('/')[0]}"
@@ -78,11 +55,11 @@ def normalize_url(url: str) -> Tuple[str, str]:
     return normalized_url, host
 
 
-# ------------------ Feed discovery ------------------
+# ================ feed discovery ====================
 async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Ищем сначала RSS/Atom, затем валидный HTML-раздел новостей/блога (без solutions/pricing и т.п.).
-    Возвращает (url, 'rss'|'atom'|'html') или (None, None).
+    Сначала ищем RSS/Atom через <link rel="alternate"> и типовые пути.
+    Если нет — пытаемся найти валидный HTML-листинг (включая ивенты).
     """
     try:
         parsed = urlparse(base_url)
@@ -90,23 +67,16 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
         host = parsed.netloc
         root = f"{scheme}://{host}"
 
-        # Популярные поддомены + корень
+        # Поддомены/базы
         subdomains = [
-            "blog",
-            "news",
-            "press",
-            "newsroom",
-            "media",
-            "stories",
-            "source",
-            "about",
-            "company",
-            "corporate",
-            "updates",
+            "blog", "news", "press", "newsroom", "media", "stories", "source",
+            "about", "company", "corporate", "updates",
+            # ивенты
+            "events",
         ]
         candidate_bases = [root] + [f"{scheme}://{sd}.{host}" for sd in subdomains]
 
-        # 1) <link rel="alternate"> RSS/Atom
+        # 1) link rel="alternate"
         for base in candidate_bases:
             try:
                 r = requests.get(base, timeout=12, headers=DEFAULT_HEADERS)
@@ -123,26 +93,13 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
             except Exception:
                 continue
 
-        # 2) Распространённые пути фидов
+        # 2) типовые RSS пути (+events)
         common_paths = [
-            "/blog/feed",
-            "/blog/rss",
-            "/blog/feed.xml",
-            "/blog/atom.xml",
-            "/blog/index.xml",
-            "/news/feed",
-            "/news/rss",
-            "/news/feed.xml",
-            "/news/atom.xml",
-            "/news/index.xml",
-            "/press/feed",
-            "/press/rss",
-            "/rss",
-            "/rss.xml",
-            "/atom.xml",
-            "/feed",
-            "/feed.xml",
-            "/index.xml",
+            "/blog/feed", "/blog/rss", "/blog/feed.xml", "/blog/atom.xml", "/blog/index.xml",
+            "/news/feed", "/news/rss", "/news/feed.xml", "/news/atom.xml", "/news/index.xml",
+            "/press/feed", "/press/rss",
+            "/events/feed", "/events/rss", "/events/index.xml",
+            "/rss", "/rss.xml", "/atom.xml", "/feed", "/feed.xml", "/index.xml",
         ]
         for base in candidate_bases:
             for path in common_paths:
@@ -150,17 +107,12 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
                 if await verify_feed(fu):
                     return fu, "rss"
 
-        # 3) HTML-разделы новостей/блога (валидация)
+        # 3) HTML-листинги (включая ивенты)
         news_paths = [
-            "/blog",
-            "/news",
-            "/press",
-            "/press-releases",
-            "/newsroom",
-            "/articles",
-            "/stories",
-            "/story",
-            "/updates",
+            "/blog", "/news", "/press", "/press-releases", "/newsroom",
+            "/articles", "/stories", "/story", "/updates",
+            # ивенты
+            "/events", "/event", "/calendar", "/webinars", "/talks",
         ]
         banned_paths = list(DEFAULT_BANNED)
 
@@ -171,10 +123,13 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
                 return False
             return any(path == np or path.startswith(np + "/") for np in news_paths)
 
-        # Сначала /blog, затем остальное
-        ordered_candidates: List[str] = []
+        # Сначала /blog и /events
+        ordered_candidates = []
         for base in candidate_bases:
-            ordered_candidates.append(urljoin(base, "/blog"))
+            for first in ("/blog", "/events"):
+                u = urljoin(base, first)
+                if u not in ordered_candidates:
+                    ordered_candidates.append(u)
         for base in candidate_bases:
             for np in news_paths:
                 u = urljoin(base, np)
@@ -190,14 +145,14 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
                     continue
                 soup = BeautifulSoup(r.content, "html.parser")
                 candidates = soup.select(
-                    "article, .post, .blog-post, .news-item, "
-                    "[class*='post'], [class*='article'], [class*='blog']"
+                    # обычные блоговые карточки
+                    "article, .post, .blog-post, .news-item, [class*='post'], [class*='article'], [class*='blog'],"
+                    # карточки ивентов
+                    ".event, .event-card, .events-list__item, [itemscope][itemtype*='Event'], [class*='event-']"
                 )
                 has_titles = 0
-                for el in candidates[:20]:
-                    t = el.select_one(
-                        "h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']"
-                    )
+                for el in candidates[:30]:
+                    t = el.select_one("h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']")
                     a = el.find("a", href=True)
                     if t and a and len(t.get_text(strip=True)) > 10:
                         has_titles += 1
@@ -206,7 +161,7 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
             except Exception:
                 continue
 
-        # 4) Фолбэк: главная как HTML
+        # 4) Фолбек: корень
         try:
             r = requests.get(root, timeout=10, headers=DEFAULT_HEADERS)
             if r.status_code == 200:
@@ -214,14 +169,13 @@ async def discover_feed(base_url: str) -> Tuple[Optional[str], Optional[str]]:
         except Exception:
             pass
 
-    except Exception as e:
-        logger.error(f"Error discovering feed for {base_url}: {e}")
+    except Exception:
+        pass
 
     return None, None
 
 
 async def verify_feed(feed_url: str) -> bool:
-    """Проверить, что URL — валидный RSS/Atom (хотя бы одна запись, без bozo)."""
     try:
         response = requests.get(feed_url, timeout=10, headers=DEFAULT_HEADERS)
         if response.status_code != 200:
@@ -232,11 +186,13 @@ async def verify_feed(feed_url: str) -> bool:
         return False
 
 
-# ------------------ Date helpers ------------------
+# ================ date helpers ======================
 def _try_parse_date_text(text: str) -> Optional[datetime]:
     text = (text or "").strip()
     if not text:
         return None
+    # иногда встречаются диапазоны дат "2025-09-01 – 2025-09-02"
+    text = re.split(r"\s*[–—-]\s*", text)[0]
     try:
         return date_parser.parse(text, fuzzy=True, ignoretz=True)
     except Exception:
@@ -245,16 +201,22 @@ def _try_parse_date_text(text: str) -> Optional[datetime]:
 
 def parse_pub_date(item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str) -> datetime:
     """
-    Дата публикации из карточки/листинга HTML:
-    1) <time datetime> или текст в <time>
-    2) мета на странице (article:published_time и т.п.)
-    3) классы .date/.published
-    4) дата в URL /YYYY/MM/DD/
-    5) now()
+    Дата из карточки листинга:
+    1) <time datetime> / <time>text</time>
+    2) itemprop="startDate" (ивенты), data-* с датой
+    3) мета на странице листинга
+    4) классы .date / .time
+    5) дата в URL
     """
-    # 1) <time>
+    # 1) time
     time_tag = item_soup.find("time")
     if time_tag:
+        # itemprop="startDate" для Event
+        if time_tag.has_attr("itemprop") and time_tag.get("itemprop") == "startDate":
+            dt = _try_parse_date_text(time_tag.get("datetime") or time_tag.get_text(" ", strip=True))
+            if dt:
+                return dt
+        # обычный datetime
         if time_tag.has_attr("datetime"):
             dt = _try_parse_date_text(time_tag["datetime"])
             if dt:
@@ -263,7 +225,20 @@ def parse_pub_date(item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str
         if dt:
             return dt
 
-    # 2) meta на листинге
+    # 2) data-* на самих карточках (часто у календарей)
+    date_like = item_soup.get("data-date") or item_soup.get("data-datetime") or item_soup.get("content")
+    if date_like:
+        dt = _try_parse_date_text(date_like)
+        if dt:
+            return dt
+    # также попробуем itemprop=startDate где-то внутри
+    start_prop = item_soup.find(attrs={"itemprop": "startDate"})
+    if start_prop:
+        dt = _try_parse_date_text(start_prop.get("content") or start_prop.get("datetime") or start_prop.get_text(" ", strip=True))
+        if dt:
+            return dt
+
+    # 3) мета на странице листинга
     meta_names = [
         ("meta", {"property": "article:published_time"}),
         ("meta", {"name": "article:published_time"}),
@@ -272,6 +247,8 @@ def parse_pub_date(item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str
         ("meta", {"name": "pubdate"}),
         ("meta", {"name": "publishdate"}),
         ("meta", {"name": "date"}),
+        # ивенты иногда используют startDate в JSON-LD/мета
+        ("meta", {"itemprop": "startDate"}),
     ]
     for tag, attrs in meta_names:
         m = page_soup.find(tag, attrs=attrs)
@@ -280,16 +257,14 @@ def parse_pub_date(item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str
             if dt:
                 return dt
 
-    # 3) Общие классы
-    cand = item_soup.select_one(
-        ".date, .post-date, .published, .posted-on, .entry-date, [class*='date'], [class*='time']"
-    )
+    # 4) общие классы на карточке
+    cand = item_soup.select_one(".date, .post-date, .published, .posted-on, .entry-date, [class*='date'], [class*='time']")
     if cand:
         dt = _try_parse_date_text(cand.get_text(" ", strip=True))
         if dt:
             return dt
 
-    # 4) Дата в URL
+    # 5) дата в URL
     if link:
         m = re.search(r"/(\d{4})/(\d{2})/(\d{2})(?:/|$)", link)
         if m:
@@ -299,12 +274,17 @@ def parse_pub_date(item_soup: BeautifulSoup, page_soup: BeautifulSoup, link: str
             except Exception:
                 pass
 
-    # 5) Фолбэк
     return datetime.now()
 
 
 async def extract_date_from_article_page(article_url: str) -> datetime:
-    """Уточняем дату публикации, сходив на страницу статьи (meta/time/JSON-LD/паттерны)."""
+    """
+    Заходим на страницу статьи/события и ищем:
+    - meta (article:published_time и т.п.)
+    - <time datetime>
+    - JSON-LD (включая Event.startDate)
+    - текстовые паттерны
+    """
     try:
         response = requests.get(article_url, timeout=12, headers=DEFAULT_HEADERS)
         if response.status_code != 200:
@@ -321,6 +301,9 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
             'meta[name="publication_date"]',
             'meta[name="date"]',
             'meta[name="created"]',
+            # иногда встречается itemprop
+            'meta[itemprop="datePublished"]',
+            'meta[itemprop="startDate"]',
         ]
         for selector in meta_selectors:
             m = soup.select_one(selector)
@@ -344,7 +327,7 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
             except Exception:
                 pass
 
-        # 3) JSON-LD
+        # 3) JSON-LD (в т.ч. Event.startDate)
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = script.string or script.text
@@ -352,13 +335,17 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
                     continue
                 obj = json.loads(data)
                 candidates = obj if isinstance(obj, list) else [obj]
-                for c in list(candidates):
+                i = 0
+                while i < len(candidates):
+                    c = candidates[i]
+                    i += 1
                     if not isinstance(c, dict):
                         continue
                     graph = c.get("@graph")
                     if isinstance(graph, list):
                         candidates.extend([g for g in graph if isinstance(g, dict)])
-                    for k in ("datePublished", "dateCreated", "uploadDate"):
+
+                    for k in ("datePublished", "dateCreated", "uploadDate", "startDate"):
                         if k in c and isinstance(c[k], str):
                             try:
                                 return date_parser.parse(c[k], ignoretz=True)
@@ -367,7 +354,7 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
             except Exception:
                 continue
 
-        # 4) Паттерны
+        # 4) текстовые паттерны
         text = soup.get_text(" ", strip=True)
         patterns = [
             r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
@@ -383,14 +370,17 @@ async def extract_date_from_article_page(article_url: str) -> datetime:
                 except Exception:
                     pass
 
-    except Exception as e:
-        logger.debug(f"Error extracting date from {article_url}: {e}")
+    except Exception:
+        pass
 
     return datetime.now()
 
 
 def parse_publication_date(entry) -> datetime:
-    """Дата для RSS/Atom записи."""
+    """
+    Для RSS / Atom: published_parsed / updated_parsed / created_parsed
+    или строковые published/updated/created/pubDate.
+    """
     date_fields = ["published_parsed", "updated_parsed", "created_parsed"]
     for field in date_fields:
         if hasattr(entry, field) and getattr(entry, field):
@@ -412,13 +402,14 @@ def parse_publication_date(entry) -> datetime:
     return datetime.now()
 
 
-# ------------------ Pagination helper ------------------
+# ================ pagination =========================
 async def _fetch_list_pages_with_pagination(start_url: str, max_pages: int = 3) -> List[BeautifulSoup]:
     """
     Загружаем страницу списка + до max_pages-1 следующих:
-    - <link rel="next">
-    - <a rel="next">
-    - эвристики /page/2 или ?page=2
+    - link rel="next"
+    - a[rel*=next]
+    - /page/N
+    - ?page=N
     """
     soups: List[BeautifulSoup] = []
     visited = set()
@@ -435,8 +426,8 @@ async def _fetch_list_pages_with_pagination(start_url: str, max_pages: int = 3) 
             soup = BeautifulSoup(r.content, "html.parser")
             soups.append(soup)
 
-            # пытаемся найти next
-            next_link: Optional[str] = None
+            # найдём next
+            next_link = None
             link_tag = soup.find("link", rel=lambda v: v and "next" in v.lower())
             if link_tag and link_tag.get("href"):
                 next_link = urljoin(current, link_tag["href"])
@@ -447,13 +438,13 @@ async def _fetch_list_pages_with_pagination(start_url: str, max_pages: int = 3) 
                     next_link = urljoin(current, a_next["href"])
 
             if not next_link:
-                # эвристики: /page/2, /page/3
+                # /page/N
                 m = re.search(r"(.*?/page/)(\d+)/?$", current)
                 if m:
                     base, num = m.group(1), int(m.group(2))
                     next_link = base + str(num + 1)
                 else:
-                    # ?page=2
+                    # ?page=N
                     if "?" in current:
                         if re.search(r"([?&])page=(\d+)", current):
                             next_link = re.sub(
@@ -466,34 +457,30 @@ async def _fetch_list_pages_with_pagination(start_url: str, max_pages: int = 3) 
                     else:
                         next_link = current.rstrip("/") + "/page/2"
 
-            # защита: не уходим на другой домен
-            if urlparse(next_link).netloc and (
-                get_domain_from_url(next_link) != get_domain_from_url(start_url)
-            ):
+            # не уходим на другой домен
+            if urlparse(next_link).netloc and (get_domain_from_url(next_link) != get_domain_from_url(start_url)):
                 break
 
             current = next_link
-        except Exception as e:
-            logger.debug(f"Pagination fetch error: {e}")
+        except Exception:
             break
 
     return soups
 
 
-# ------------------ Domain fragments ------------------
+# ================ fragments per domain ==============
 def _fragments_for_domain(domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    rules: Dict[str, Dict[str, Tuple[str, ...]]] = DOMAIN_RULES.get(domain, {})
+    rules = DOMAIN_RULES.get(domain, {})
     allow = rules.get("allow", DEFAULT_ALLOWED)
     ban = rules.get("ban", DEFAULT_BANNED)
     return allow, ban
 
 
-# ------------------ Fetch items ------------------
+# ================ main: fetch items =================
 async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
     """
-    Сбор новостей:
-    - RSS/Atom: парсинг через feedparser + категоризация
-    - HTML: ищем карточки и/или все ссылки разделов блога; дату уточняем со страницы
+    Унифицированный сбор элементов из RSS/Atom или HTML-листингов (в т.ч. ивенты).
+    Каждый элемент: {id, title, link, date, category}
     """
     items: List[Dict] = []
 
@@ -502,14 +489,12 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
             response = requests.get(feed_url, timeout=15, headers=DEFAULT_HEADERS)
             response.raise_for_status()
             feed = feedparser.parse(response.content)
-
             for entry in feed.entries:
                 pub_date = parse_publication_date(entry)
 
-                # Теги/summary для лучшей категоризации
+                # категории/summary для лучшей классификации
                 rss_tags: List[str] = []
                 if hasattr(entry, "tags") and entry.tags:
-                    # feedparser хранит либо списком объектов, либо dict-like
                     for t in entry.tags:
                         term = (t.get("term") if isinstance(t, dict) else getattr(t, "term", None))
                         if term:
@@ -524,15 +509,13 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                 )
 
                 item_id = entry.get("id", entry.get("link", "")) or f"{entry.get('title', '')}_{pub_date.isoformat()}"
-                items.append(
-                    {
-                        "id": item_id,
-                        "title": entry.get("title", "No title"),
-                        "link": entry.get("link", ""),
-                        "date": pub_date,
-                        "category": category,
-                    }
-                )
+                items.append({
+                    "id": item_id,
+                    "title": entry.get("title", "No title"),
+                    "link": entry.get("link", ""),
+                    "date": pub_date,
+                    "category": category,
+                })
 
         elif feed_type == "html":
             soups = await _fetch_list_pages_with_pagination(feed_url, max_pages=3)
@@ -540,33 +523,26 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
 
             found_items: List[Tuple[BeautifulSoup, BeautifulSoup]] = []
 
-            # 1) Ищем «карточки»
+            # 1) блоговые + ивентные карточки
             for soup in soups:
                 selectors = [
+                    # блог/новости
                     "article",
-                    ".blog-post",
-                    ".post",
-                    ".news-item",
-                    ".article-item",
-                    ".entry",
-                    ".post-item",
-                    ".blog-item",
-                    ".news-post",
-                    ".article-card",
-                    "[class*='post-']",
-                    "[class*='blog-']",
-                    "[class*='article-']",
-                    "[class*='news-']",
-                    "[class*='entry-']",
+                    ".blog-post", ".post", ".news-item", ".article-item", ".entry",
+                    ".post-item", ".blog-item", ".news-post", ".article-card",
+                    "[class*='post-']", "[class*='blog-']", "[class*='article-']",
+                    "[class*='news-']", "[class*='entry-']",
+                    # ивенты
+                    ".event", ".event-card", ".events-list__item",
+                    "[itemscope][itemtype*='Event']",
+                    "[class*='event-']",
                 ]
                 for selector in selectors:
                     try:
                         elements = soup.select(selector)
-                        valid_articles: List[Tuple[BeautifulSoup, BeautifulSoup]] = []
+                        valid_articles = []
                         for elem in elements:
-                            title_elem = elem.select_one(
-                                "h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']"
-                            )
+                            title_elem = elem.select_one("h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']")
                             link_elem = elem.find("a", href=True)
                             if not (title_elem and link_elem):
                                 continue
@@ -575,7 +551,7 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                             full = urljoin(feed_url, link_href)
                             path_lower = urlparse(full).path.lower()
                             if (
-                                len(title_text) > 8
+                                len(title_text) > 6
                                 and any(path_lower == af or path_lower.startswith(af + "/") for af in allowed_fragments)
                                 and not any(path_lower == bf or path_lower.startswith(bf + "/") for bf in banned_fragments)
                                 and not any(sk in link_href.lower() for sk in ["mailto:", "tel:", "#", "javascript:"])
@@ -584,11 +560,10 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                         if len(valid_articles) >= 2:
                             found_items.extend(valid_articles)
                             break
-                    except Exception as e:
-                        logger.debug(f"Selector error {selector}: {e}")
+                    except Exception:
                         continue
 
-            # 2) Если карточек мало — «план C»: собрать все ссылки /blog/... и т.п.
+            # 2) если карточек мало — соберём по всем ссылкам разрешённых разделов
             if len(found_items) < 3:
                 seen_links = set()
                 for soup in soups:
@@ -604,16 +579,13 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                             and not any(path_lower == bf or path_lower.startswith(bf + "/") for bf in banned_fragments)
                             and not any(sk in href.lower() for sk in ["mailto:", "tel:", "#", "javascript:"])
                         ):
-                            # псевдокарточка: ближайший контейнер
-                            container: BeautifulSoup = a
+                            container = a
                             for _ in range(3):
                                 if container.parent:
                                     container = container.parent
                             found_items.append((container, soup))
 
-            logger.info(f"Processing {len(found_items)} potential articles from HTML pages")
-
-            # 3) Формируем items (дату уточняем со страницы)
+            # 3) финальное формирование items (уточняем дату со страницы)
             added = set()
             for item_node, page_soup in found_items:
                 try:
@@ -626,19 +598,14 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
                     if "mailto:" in link or "tel:" in link or link.endswith("#"):
                         continue
 
-                    title_elem = item_node.select_one(
-                        "h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']"
-                    )
-                    title = ""
-                    if title_elem:
-                        title = title_elem.get_text(" ", strip=True)
-                    if not title:
-                        title = a.get_text(" ", strip=True)
-                    title = re.sub(r"\s+", " ", title).strip()
-                    if len(title) < 5:
+                    # заголовок
+                    title_elem = item_node.select_one("h1, h2, h3, h4, h5, .title, [class*='title'], [class*='headline']")
+                    title = title_elem.get_text(" ", strip=True) if title_elem else a.get_text(" ", strip=True)
+                    title = re.sub(r"\s+", " ", (title or "")).strip()
+                    if len(title) < 3:
                         continue
 
-                    # Предварительная дата + точное уточнение
+                    # дата: сначала с карточки, затем — со страницы
                     pub_date = parse_pub_date(item_node, page_soup, link)
                     precise = await extract_date_from_article_page(link)
                     if precise:
@@ -646,41 +613,21 @@ async def fetch_items(feed_url: str, feed_type: str) -> List[Dict]:
 
                     category = classify_news(title, link)
 
-                    items.append(
-                        {
-                            "id": link,
-                            "title": title[:200],
-                            "link": link,
-                            "date": pub_date,
-                            "category": category,
-                        }
-                    )
+                    items.append({
+                        "id": link,
+                        "title": title[:200],
+                        "link": link,
+                        "date": pub_date,
+                        "category": category,
+                    })
                     added.add(link)
 
-                    if len(items) >= 40:
+                    if len(items) >= 80:
                         break
-                except Exception as e:
-                    logger.debug(f"Error parsing HTML item: {e}")
+                except Exception:
                     continue
 
-    except Exception as e:
-        logger.error(f"Error fetching items from {feed_url}: {e}")
+    except Exception:
+        pass
 
-    logger.info(f"Successfully parsed {len(items)} items")
     return items
-
-
-__all__ = [
-    "get_domain_from_url",
-    "normalize_url",
-    "discover_feed",
-    "verify_feed",
-    "_try_parse_date_text",
-    "parse_pub_date",
-    "extract_date_from_article_page",
-    "parse_publication_date",
-    "_fetch_list_pages_with_pagination",
-    "fetch_items",
-    "_fragments_for_domain",
-]
-
