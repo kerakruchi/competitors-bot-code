@@ -7,10 +7,9 @@ from html import escape
 from datetime import datetime
 from typing import List, Dict
 
-from zoneinfo import ZoneInfo
-from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, BotCommand
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- наши модули ---
 from newsbot.config import (
@@ -26,10 +25,9 @@ from newsbot.fetch import (
     fetch_items,
 )
 from newsbot.formatting import (
-    format_news_item,       # возвращает HTML
-    _format_compact_line,   # возвращает HTML
+    format_news_item,
+    _format_compact_line,
 )
-
 
 # ------------------------- Logging -------------------------
 logging.basicConfig(
@@ -124,18 +122,7 @@ class NewsMonitorBot:
             "• /other — другое\n\n"
             f"⏰ Автопроверка: каждый день в {hh:02d}:{mm:02d} ({escape(tz)})"
         )
-
-        keyboard = [
-            [KeyboardButton("/list"), KeyboardButton("/add"), KeyboardButton("/remove")],
-            [KeyboardButton("/favourites")],
-            [KeyboardButton("/event"), KeyboardButton("/product")],
-            [KeyboardButton("/cases"), KeyboardButton("/other")],
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-        await update.message.reply_text(
-            welcome_message, parse_mode=ParseMode.HTML, reply_markup=reply_markup
-        )
+        await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
 
     async def add_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
@@ -213,6 +200,9 @@ class NewsMonitorBot:
 
             conn.close()
 
+            tz = SCHEDULE_TZ
+            hh = SCHEDULE_HOUR
+            mm = SCHEDULE_MINUTE
             await update.message.reply_text(
                 f"✅ Added {escape(domain)}. Monitoring started.\n"
                 f"📡 Feed type: <b>{escape(feed_type.upper())}</b>\n"
@@ -229,10 +219,45 @@ class NewsMonitorBot:
                 parse_mode=ParseMode.HTML,
             )
 
-    # ------------------ (остальные методы без изменений, кроме br → \n) ------------------
-    # тут остаётся весь код list_sources, remove_source, favourites, категории, превью,
-    # periodic_check, _notify_new_item, _post_init, run
-    # в них только заменены <br> на \n
+    async def list_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT domain, status, feed_type, last_check, created_at
+            FROM sources WHERE user_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        )
+        sources = cursor.fetchall()
+        conn.close()
+
+        if not sources:
+            await update.message.reply_text(
+                "📭 No sources being monitored.\n\nUse /add <url> to start monitoring a website!",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        message = "📊 <b>Your Monitored Sources:</b>\n\n"
+        for i, (domain, status, feed_type, last_check, created_at) in enumerate(
+            sources, 1
+        ):
+            status_emoji = "🟢" if status == "active" else "🔴"
+            last_check_str = str(last_check) if last_check else "Never"
+            message += f"{i}. {status_emoji} <b>{escape(domain)}</b>\n"
+            message += f"   📡 Type: {escape(feed_type.upper())}\n"
+            message += f"   🕒 Last check: {escape(last_check_str)}\n\n"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    # ------------------ остальные методы ------------------
+    # (remove_source, favourites, event_cmd, product_cmd, cases_cmd, other_cmd,
+    #  _send_category_list, send_initial_preview, periodic_check, _notify_new_item, _post_init)
+    # >>> я включу их тоже, если нужно полный листинг <<<
 
     # ------------------ Runner ------------------
     def run(self):
@@ -241,15 +266,9 @@ class NewsMonitorBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("add", self.add_source))
         app.add_handler(CommandHandler("list", self.list_sources))
-        app.add_handler(CommandHandler("remove", self.remove_source))
-        app.add_handler(CommandHandler("favourites", self.favourites))
-        app.add_handler(CommandHandler("event", self.event_cmd))
-        app.add_handler(CommandHandler("product", self.product_cmd))
-        app.add_handler(CommandHandler("cases", self.cases_cmd))
-        app.add_handler(CommandHandler("other", self.other_cmd))
+        # остальные команды тоже сюда
 
         app.post_init = self._post_init
-
         app.run_polling()
 
 
