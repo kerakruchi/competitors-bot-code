@@ -3,10 +3,29 @@
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from datetime import datetime
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (news-monitor-bot)"}
+
+
+# ------------------- URL Normalization -------------------
+def normalize_url(url: str):
+    """
+    Нормализует URL и возвращает (url, domain).
+    Пример: "microsoft.com" -> ("https://microsoft.com", "microsoft.com")
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    normalized = f"{parsed.scheme}://{parsed.netloc}"
+    return normalized, domain
 
 
 # ------------------- Feed discovery -------------------
@@ -21,12 +40,12 @@ async def discover_feed(url: str):
         resp.raise_for_status()
         text = resp.text
 
-        # feedparser определяет RSS/Atom
+        # feedparser попробует RSS/Atom
         parsed = feedparser.parse(text)
         if parsed.bozo == 0 and parsed.entries:
             return url, "rss" if "rss" in text.lower() else "atom"
 
-        # если нет — пробуем HTML
+        # иначе — HTML
         return url, "html"
 
     except Exception:
@@ -97,7 +116,7 @@ async def fetch_items(url, feed_type: str):
         for entry in parsed.entries:
             try:
                 dt = None
-                if hasattr(entry, "published"):
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
                     try:
                         dt = datetime(*entry.published_parsed[:6])
                     except Exception:
