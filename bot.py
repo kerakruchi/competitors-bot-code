@@ -6,8 +6,8 @@ import logging
 from html import escape
 from datetime import datetime, time as dtime
 from typing import List, Dict
-
 from zoneinfo import ZoneInfo
+
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -26,13 +26,13 @@ from newsbot.fetch import (
     fetch_items,
 )
 from newsbot.formatting import (
-    format_news_item,       # теперь возвращает HTML
-    _format_compact_line,   # теперь возвращает HTML
+    format_news_item,       # HTML
+    _format_compact_line,   # HTML
 )
 
 # ------------------------- Logging -------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("news-monitor-bot")
@@ -41,6 +41,8 @@ logger = logging.getLogger("news-monitor-bot")
 # ========================= BOT ============================
 class NewsMonitorBot:
     def __init__(self, token: str):
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
         self.token = token
         self.db_path = DB_PATH
         self.init_database()
@@ -50,7 +52,6 @@ class NewsMonitorBot:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
-        # Источники
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS sources (
@@ -69,7 +70,6 @@ class NewsMonitorBot:
         """
         )
 
-        # Кеш новостей (для дедупликации и выборок)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS item_cache (
@@ -86,7 +86,6 @@ class NewsMonitorBot:
         """
         )
 
-        # Избранное (опционально)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS favourites (
@@ -182,8 +181,7 @@ class NewsMonitorBot:
             source_id = cursor.lastrowid
             conn.commit()
 
-            # Получаем ВСЕ текущие материалы и сразу кешируем их,
-            # чтобы не присылать задним числом.
+            # Кешируем текущие материалы, чтобы не слать задним числом
             items = await fetch_items(feed_url, feed_type)
             if items:
                 for it in items:
@@ -217,10 +215,10 @@ class NewsMonitorBot:
                 parse_mode=ParseMode.HTML,
             )
 
-            # Отправляем только 3 последних карточки (но в кеш уже положили все)
+            # Превью из 3 карточек
             await self.send_initial_preview(update, domain, items or [], limit=3)
 
-            # Отметим, что первичная отправка была
+            # Отметим первичную отправку
             conn2 = sqlite3.connect(self.db_path, timeout=30)
             c2 = conn2.cursor()
             c2.execute(
@@ -325,7 +323,6 @@ class NewsMonitorBot:
         )
 
     async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать избранные (если добавлялись внешне)."""
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
@@ -357,13 +354,17 @@ class NewsMonitorBot:
             except Exception:
                 dt = datetime.now()
             date_str = dt.strftime("%b %d, %Y")
-            lines.append(f"<b>{escape(title)}</b>\n📅 {escape(date_str)}\n🔗 <a href=\"{escape(link, quote=True)}\">{escape(link)}</a>\n")
+            lines.append(
+                f"<b>{escape(title)}</b>\n"
+                f"📅 {escape(date_str)}\n"
+                f"🔗 <a href=\"{escape(link, quote=True)}\">{escape(link)}</a>\n"
+            )
 
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
-    # --- Команды категорий: показываем ТОЛЬКО выбранную категорию ---
+    # --- Категории ---
     async def event_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "event")
 
@@ -379,11 +380,7 @@ class NewsMonitorBot:
     async def _send_category_list(
         self, update: Update, category: str, limit: int = 10
     ):
-        """
-        Берём элементы пользователя из кеша, переклассифицируем на лету (по title+link)
-        и возвращаем только выбранную категорию одним сообщением.
-        """
-        from newsbot.classify import classify_news  # локальный импорт, чтобы избежать циклов
+        from newsbot.classify import classify_news  # локальный импорт
 
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -413,187 +410,4 @@ class NewsMonitorBot:
                         else pub_date
                     )
                     items.append(
-                        {"title": title, "link": link, "date": dt, "category": cat}
-                    )
-            except Exception:
-                continue
-
-        if not items:
-            await update.message.reply_text("Ничего не найдено в этой категории пока.")
-            return
-
-        items.sort(key=lambda x: x["date"], reverse=True)
-        items = items[:limit]
-
-        title_map = {
-            "event": "Новости про ивенты",
-            "product": "Новости про продукты",
-            "cases": "Новости про кейсы",
-            "other": "Другие новости",
-        }
-        lines = [f"<b>{escape(title_map.get(category, 'Новости'))}</b>"]
-        for it in items:
-            lines.append(_format_compact_line(it))
-
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
-
-    # ------------------ Initial preview ------------------
-    async def send_initial_preview(
-        self,
-        update: Update,
-        domain: str,
-        items: List[Dict],
-        limit: int = 3,
-    ):
-        """Отправляем только превью из N карточек (кеш уже заполнен ранее)."""
-        if not items:
-            await update.message.reply_text(
-                f"📭 No recent items found for {escape(domain)}",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        items_sorted = sorted(items, key=lambda x: x["date"], reverse=True)
-        preview = items_sorted[:limit]
-
-        await update.message.reply_text(
-            f"📰 <b>Latest {len(preview)} items from {escape(domain)}:</b>\n<i>Found {len(items_sorted)} total articles</i>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        for i, item in enumerate(preview, 1):
-            message = f"<b>{i}/{len(preview)}</b>\n{format_news_item(item)}"
-            await update.message.reply_text(
-                message, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-            )
-            await asyncio.sleep(0.25)
-
-    # ------------------ Scheduler job ------------------
-    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
-        """Ежедневная проверка всех источников (по расписанию)."""
-        logger.info("Starting scheduled check for all sources...")
-
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT id, user_id, domain, feed_url, feed_type
-            FROM sources
-            WHERE status = 'active' AND first_sent = TRUE
-            """
-        )
-        sources = cursor.fetchall()
-        logger.info(f"Checking {len(sources)} active sources...")
-
-        for source_id, user_id, domain, feed_url, feed_type in sources:
-            try:
-                items = await fetch_items(feed_url, feed_type)
-                if not items:
-                    continue
-
-                # Кеш уже содержит всё старое, сравниваем по item_id
-                cursor.execute(
-                    "SELECT item_id FROM item_cache WHERE source_id = ?", (source_id,)
-                )
-                cached_ids = {row[0] for row in cursor.fetchall()}
-
-                new_items = [item for item in items if item["id"] not in cached_ids]
-
-                if new_items:
-                    logger.info(f"Found {len(new_items)} new items for {domain}")
-                    new_items.sort(key=lambda x: x["date"])  # отправим по возрастанию
-                    for item in new_items:
-                        await self._notify_new_item(context, user_id, item)
-
-                        # Сохраняем в кеш
-                        try:
-                            cursor.execute(
-                                """
-                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    source_id,
-                                    item["id"],
-                                    item.get("title"),
-                                    item.get("link"),
-                                    item.get("date"),
-                                ),
-                            )
-                        except Exception:
-                            continue
-                        await asyncio.sleep(0.4)
-
-                # Обновляем last_check
-                cursor.execute(
-                    "UPDATE sources SET last_check = ? WHERE id = ?",
-                    (datetime.now(), source_id),
-                )
-
-            except Exception as e:
-                logger.error(f"Error checking source {domain}: {e}")
-
-        conn.commit()
-        conn.close()
-        logger.info("Scheduled check completed.")
-
-    async def _notify_new_item(
-        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, item: Dict
-    ):
-        """Строгое уведомление о новой статье по шаблону (HTML + экранирование)."""
-        cat = (item.get("category") or "other").lower()
-        dt = item.get("date") or datetime.now()
-        try:
-            date_str = (
-                dt.strftime("%b %d, %Y %H:%M") if isinstance(dt, datetime) else str(dt)
-            )
-        except Exception:
-            date_str = str(dt)
-
-        title_html = escape(item.get("title", "No title"))
-        link = item.get("link", "")
-        link_html = escape(link, quote=True)
-
-        msg = (
-            "Я нашёл новую статью для тебя:\n\n"
-            f"📰 <b>{title_html}</b>\n"
-            f"📅 {escape(date_str)}\n"
-            f"🏷️ {escape(CAT_RU.get(cat, 'другое'))} ({escape(cat)})\n"
-            f"🔗 <a href=\"{link_html}\">{escape(link)}</a>"
-        )
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=msg,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
-    # ------------------ Bot menu (command list) ------------------
-    async def _post_init(self, app: Application):
-        """Обновляем список команд в меню клиента Telegram."""
-        commands = [
-            BotCommand("start", "Запустить бота"),
-            BotCommand("list", "Список доменов"),
-            BotCommand("add", "Добавить домен: /add url"),
-            BotCommand("remove", "Удалить домен: /remove domain"),
-            BotCommand("favourites", "Показать избранные"),
-            BotCommand("event", "Новости про ивенты"),
-            BotCommand("product", "Новости про продукты"),
-            BotCommand("cases", "Новости про кейсы"),
-            BotCommand("other", "Другие новости"),
-        ]
-        await app.bot.set_my_commands(commands)
-
-    # ------------------ Runner ------------------
-    def run(self):
-        app = Application.builder().token(self.token).build()
-
-        # Команды
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("add", self.add_source))
-        app.add_handler(CommandHandler("list", self.list_sources))
-        app.add_handler(CommandHandler("remove", self.remove_source))
-        app.add_handler(CommandHandler("favourites", self.favourites))
+                        {"title": titl
