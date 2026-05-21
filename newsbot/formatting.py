@@ -1,12 +1,9 @@
 # newsbot/formatting.py
-"""
-Форматирование карточек для отправки в Telegram.
-Использует CAT_EMOJI из config.
-"""
-
+"""Форматирование карточек для Telegram (HTML parse mode)."""
 from __future__ import annotations
 
 from datetime import datetime
+from html import escape
 from typing import Dict
 
 from dateutil import parser as date_parser
@@ -15,7 +12,6 @@ from .config import CAT_EMOJI
 
 
 def _to_datetime(dt_like) -> datetime:
-    """Аккуратно превратить строку/дату в datetime (без TZ)."""
     if isinstance(dt_like, datetime):
         return dt_like
     if isinstance(dt_like, str):
@@ -28,10 +24,11 @@ def _to_datetime(dt_like) -> datetime:
 
 def format_news_item(item: Dict) -> str:
     """
-    Большая карточка:
-    🎪 *Title*
+    Большая карточка (HTML):
+    🎪 <b>Title</b>
     📅 Today 12:34
     🏷️ event
+    💬 краткое описание (если есть)
     🔗 https://...
     """
     pub_date = _to_datetime(item.get("date"))
@@ -47,32 +44,46 @@ def format_news_item(item: Dict) -> str:
     else:
         date_str = pub_date.strftime("%b %d, %Y %H:%M")
 
-    title = item.get("title", "No title")
+    title = item.get("title") or "No title"
     if len(title) > 120:
         title = title[:117] + "…"
 
     tag = (item.get("category") or "other").lower()
     tag_emoji = CAT_EMOJI.get(tag, "🏷️")
+    link = item.get("link") or ""
+    summary = item.get("summary") or ""
 
-    return f"{tag_emoji} *{title}*\n📅 {date_str}\n🏷️ {tag}\n🔗 {item.get('link', '')}\n"
+    result = (
+        f"{tag_emoji} <b>{escape(title)}</b>\n"
+        f"📅 {escape(date_str)}\n"
+        f"🏷️ {escape(tag)}\n"
+        f"🔗 {escape(link)}\n"
+    )
+    if summary:
+        result += f"💬 <i>{escape(summary)}</i>\n"
+
+    return result
 
 
 def _format_compact_line(item: Dict) -> str:
     """
-    Компактная строка для списков:
-    🎪 *Title*
-    📅 Aug 17, 2025
-    🔗 https://...
+    Компактная строка для списков (HTML):
+    🎪 <b>Title</b>
+    📅 Aug 17, 2025 · 🔗 https://...
     """
     dt = _to_datetime(item.get("date"))
     date_str = dt.strftime("%b %d, %Y")
     cat = (item.get("category") or "other").lower()
     emoji = CAT_EMOJI.get(cat, "🏷️")
-    title = item.get("title", "No title")
+    title = item.get("title") or "No title"
     if len(title) > 140:
         title = title[:137] + "…"
-    return f"{emoji} *{title}*\n📅 {date_str}\n🔗 {item.get('link', '')}\n"
+    link = item.get("link") or ""
+
+    return (
+        f"{emoji} <b>{escape(title)}</b>\n"
+        f"📅 {escape(date_str)} · <a href=\"{escape(link, quote=True)}\">открыть</a>\n"
+    )
 
 
 __all__ = ["format_news_item", "_format_compact_line"]
-

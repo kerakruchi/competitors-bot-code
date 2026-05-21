@@ -28,6 +28,10 @@ DOMAIN_RULES = {
         "allow": ("/news", "/blog"),
         "ban": (),
     },
+    "ambient.ai": {
+        "allow": ("/blog", "/press"),
+        "ban": ("/careers", "/pricing", "/product", "/solutions"),
+    },
     # добавляй сюда кастомные правила для доменов по мере необходимости
 }
 
@@ -70,10 +74,11 @@ CAT_EMOJI = {
 }
 
 # ====== Domains with relaxed HTML filtering (bypass allow/ban checks on list pages) ======
-# Используется для сайтов со сложной версткой событий/лендингов, где обычные фильтры
-# могут отсекать полезные ссылки. Для этих доменов применяются более мягкие условия
-# (и дополнительно пробуем /events, /event, /conf, /conference).
 BYPASS_FILTER_DOMAINS = {
     "events.yandex.ru",
     # добавляй сюда другие домены по необходимости
 }
+
+# ====== AI (OpenAI API) ======
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+AI_ENABLED = bool(OPENAI_API_KEY)

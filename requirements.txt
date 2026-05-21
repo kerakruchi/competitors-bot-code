@@ -4,3 +4,8 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 python-dateutil==2.9.0.post0
 tzdata==2025.1
+openai>=1.30.0
+tenacity>=8.2.0
+python-dotenv>=1.0.0
+# Playwright — опционально, для JS-сайтов и LinkedIn:
+# pip install playwright && playwright install chromium

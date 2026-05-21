@@ -1,36 +1,39 @@
 # bot.py
 import os
 import asyncio
+from dotenv import load_dotenv
+load_dotenv()
 import sqlite3
 import logging
 from html import escape
-from datetime import datetime, time as dtime
-from typing import List, Dict
+from datetime import datetime
+from typing import List, Dict, Tuple
 from zoneinfo import ZoneInfo
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# --- наши модули ---
 from newsbot.config import (
     DB_PATH,
     SCHEDULE_TZ,
     SCHEDULE_HOUR,
     SCHEDULE_MINUTE,
     CAT_RU,
+    CAT_EMOJI,
+    AI_ENABLED,
 )
-from newsbot.fetch import (
-    normalize_url,
-    discover_feed,
-    fetch_items,
-)
-from newsbot.formatting import (
-    format_news_item,       # возвращает HTML
-    _format_compact_line,   # возвращает HTML
-)
+from newsbot.fetch import normalize_url, discover_feed, fetch_items
+from newsbot.classify import classify_news
+from newsbot.formatting import format_news_item, _format_compact_line
+from newsbot.digest import format_digest
 
-# ------------------------- Logging -------------------------
+try:
+    from playwright.async_api import async_playwright as _pw  # noqa: F401
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -39,6 +42,7 @@ logger = logging.getLogger("news-monitor-bot")
 
 
 # ========================= BOT ============================
+
 class NewsMonitorBot:
     def __init__(self, token: str):
         if not token:
@@ -47,31 +51,29 @@ class NewsMonitorBot:
         self.db_path = DB_PATH
         self.init_database()
 
-    # ------------------ DB init ------------------
+    # ---------------------- DB ----------------------
+
     def init_database(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
 
-        cursor.execute(
-            """
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 domain TEXT NOT NULL,
                 url TEXT NOT NULL,
                 feed_url TEXT,
-                feed_type TEXT,  -- 'rss', 'atom', 'html'
+                feed_type TEXT,
                 status TEXT DEFAULT 'active',
                 first_sent BOOLEAN DEFAULT FALSE,
                 last_check TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, domain)
             )
-            """
-        )
+        """)
 
-        cursor.execute(
-            """
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS item_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER,
@@ -79,15 +81,22 @@ class NewsMonitorBot:
                 title TEXT,
                 link TEXT,
                 pub_date TIMESTAMP,
+                category TEXT DEFAULT 'other',
+                summary TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (source_id) REFERENCES sources (id),
                 UNIQUE(source_id, item_id)
             )
-            """
-        )
+        """)
 
-        cursor.execute(
-            """
+        # Миграция: добавляем новые колонки если их нет
+        for col, col_def in [("category", "TEXT DEFAULT 'other'"), ("summary", "TEXT")]:
+            try:
+                cursor.execute(f"ALTER TABLE item_cache ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS favourites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -96,48 +105,127 @@ class NewsMonitorBot:
                 pub_date TIMESTAMP,
                 category TEXT,
                 source_domain TEXT,
+                summary TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, link)
             )
-            """
-        )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                digest_mode BOOLEAN DEFAULT FALSE,
+                schedule_hour INTEGER DEFAULT 12,
+                schedule_minute INTEGER DEFAULT 0,
+                schedule_tz TEXT DEFAULT 'Europe/Moscow',
+                last_digest_date TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         conn.commit()
         conn.close()
 
-    # ------------------ Commands ------------------
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        tz = SCHEDULE_TZ
-        hh = SCHEDULE_HOUR
-        mm = SCHEDULE_MINUTE
-        welcome_message = (
-            "🤖 <b>Welcome to News Monitor Bot!</b>\n\n"
-            "Я помогу мониторить новости компаний и присылать новые посты.\n\n"
-            "<b>Команды:</b>\n"
-            "• /start — запустить бота\n"
-            "• /list — список доменов\n"
-            "• /add &lt;url&gt; — добавить домен\n"
-            "• /remove &lt;domain&gt; — удалить домен\n"
-            "• /favourites — показать избранные\n"
-            "• /event — только ивенты\n"
-            "• /product — про продукты\n"
-            "• /cases — кейсы\n"
-            "• /other — другое\n\n"
-            f"⏰ Автопроверка: каждый день в {hh:02d}:{mm:02d} ({escape(tz)})"
+    def _get_user_settings(self, user_id: int) -> Dict:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT digest_mode, schedule_hour, schedule_minute, schedule_tz, last_digest_date "
+            "FROM user_settings WHERE user_id = ?",
+            (user_id,),
         )
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "digest_mode": bool(row[0]),
+                "schedule_hour": row[1],
+                "schedule_minute": row[2],
+                "schedule_tz": row[3],
+                "last_digest_date": row[4],
+            }
+        return {
+            "digest_mode": False,
+            "schedule_hour": SCHEDULE_HOUR,
+            "schedule_minute": SCHEDULE_MINUTE,
+            "schedule_tz": SCHEDULE_TZ,
+            "last_digest_date": None,
+        }
+
+    def _ensure_user_settings(self, user_id: int):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO user_settings (user_id, schedule_hour, schedule_minute, schedule_tz) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, SCHEDULE_HOUR, SCHEDULE_MINUTE, SCHEDULE_TZ),
+        )
+        conn.commit()
+        conn.close()
+
+    # ---------------------- AI ----------------------
+
+    async def _classify_item(self, item: Dict) -> Tuple[str, str]:
+        """Возвращает (category, summary). AI если доступен, иначе regex."""
+        if AI_ENABLED:
+            try:
+                from newsbot.ai_classify import ai_classify_and_summarize
+                cat, summary = await ai_classify_and_summarize(
+                    title=item.get("title", ""),
+                    link=item.get("link", ""),
+                )
+                return cat, summary
+            except Exception:
+                pass
+        return classify_news(item.get("title", ""), item.get("link", "")), ""
+
+    # ---------------------- Commands ----------------------
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self._ensure_user_settings(user_id)
+        settings = self._get_user_settings(user_id)
+        hh = settings["schedule_hour"]
+        mm = settings["schedule_minute"]
+        tz = settings["schedule_tz"]
+        digest_status = "вкл" if settings["digest_mode"] else "выкл"
+        ai_status = "вкл ✅" if AI_ENABLED else "выкл (нет OPENAI_API_KEY)"
+
+        msg = (
+            "🤖 <b>News Monitor Bot</b>\n\n"
+            "Мониторю новости конкурентов и присылаю новые публикации.\n\n"
+            "<b>Источники:</b>\n"
+            "• /add &lt;url&gt; — сайт или LinkedIn-страница\n"
+            "• /remove &lt;domain&gt; — удалить\n"
+            "• /pause &lt;domain&gt; — приостановить\n"
+            "• /resume &lt;domain&gt; — возобновить\n"
+            "• /list — все источники\n\n"
+            "<b>Новости:</b>\n"
+            "• /check — проверить прямо сейчас\n"
+            "• /search &lt;запрос&gt; — поиск по кешу\n"
+            "• /event · /product · /cases · /other — по категориям\n"
+            "• /favourites — избранное\n\n"
+            "<b>Настройки:</b>\n"
+            "• /schedule HH:MM — время уведомлений\n"
+            f"• /digest — дайджест (сейчас: <b>{digest_status}</b>)\n\n"
+            f"⏰ Проверка в <b>{hh:02d}:{mm:02d} ({escape(tz)})</b>\n"
+            f"🤖 AI-классификация: <b>{ai_status}</b>"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def add_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text(
-                "Usage: /add <company_website_url>\n\n"
-                "Example:\n/add https://microsoft.com\n/add techcrunch.com",
+                "Usage: /add &lt;url&gt;\n\nПримеры:\n"
+                "/add https://microsoft.com\n"
+                "/add https://linkedin.com/company/microsoft",
                 parse_mode=ParseMode.HTML,
             )
             return
 
         url = context.args[0]
         user_id = update.effective_user.id
+        self._ensure_user_settings(user_id)
 
         try:
             normalized_url, domain = normalize_url(url)
@@ -150,54 +238,41 @@ class NewsMonitorBot:
             )
             if cursor.fetchone():
                 await update.message.reply_text(
-                    f"❌ {escape(domain)} is already being monitored.",
-                    parse_mode=ParseMode.HTML,
+                    f"❌ {escape(domain)} уже отслеживается.", parse_mode=ParseMode.HTML
                 )
                 conn.close()
                 return
 
             await update.message.reply_text(
-                f"🔍 Analyzing {escape(domain)}... Looking for news feeds...",
-                parse_mode=ParseMode.HTML,
+                f"🔍 Анализирую {escape(domain)}...", parse_mode=ParseMode.HTML
             )
 
             feed_url, feed_type = await discover_feed(normalized_url)
             if not feed_url:
                 await update.message.reply_text(
-                    f"❌ Could not find a news feed for {escape(domain)}",
-                    parse_mode=ParseMode.HTML,
+                    f"❌ Не удалось найти фид для {escape(domain)}", parse_mode=ParseMode.HTML
                 )
                 conn.close()
                 return
 
-            # Сохраняем источник
             cursor.execute(
-                """
-                INSERT INTO sources (user_id, domain, url, feed_url, feed_type)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO sources (user_id, domain, url, feed_url, feed_type) VALUES (?, ?, ?, ?, ?)",
                 (user_id, domain, normalized_url, feed_url, feed_type),
             )
             source_id = cursor.lastrowid
             conn.commit()
 
-            # Кешируем текущие материалы, чтобы не слать задним числом
             items = await fetch_items(feed_url, feed_type)
             if items:
                 for it in items:
+                    cat, summary = await self._classify_item(it)
                     try:
                         cursor.execute(
-                            """
-                            INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                            VALUES (?, ?, ?, ?, ?)
-                            """,
-                            (
-                                source_id,
-                                it.get("id"),
-                                it.get("title"),
-                                it.get("link"),
-                                it.get("date"),
-                            ),
+                            "INSERT OR IGNORE INTO item_cache "
+                            "(source_id, item_id, title, link, pub_date, category, summary) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (source_id, it.get("id"), it.get("title"),
+                             it.get("link"), it.get("date"), cat, summary),
                         )
                     except Exception:
                         continue
@@ -205,20 +280,23 @@ class NewsMonitorBot:
 
             conn.close()
 
-            tz = SCHEDULE_TZ
-            hh = SCHEDULE_HOUR
-            mm = SCHEDULE_MINUTE
+            extra = ""
+            if feed_type == "linkedin" and not _PLAYWRIGHT_AVAILABLE:
+                extra = (
+                    "\n⚠️ LinkedIn требует Playwright:\n"
+                    "<code>pip install playwright && playwright install chromium</code>"
+                )
+
             await update.message.reply_text(
-                f"✅ Added {escape(domain)}. Monitoring started.\n"
-                f"📡 Feed type: <b>{escape(feed_type.upper())}</b>\n"
-                f"⏰ Daily checks at <b>{hh:02d}:{mm:02d} ({escape(tz)})</b>",
+                f"✅ Добавлен <b>{escape(domain)}</b>\n"
+                f"📡 Тип: <b>{escape(feed_type.upper())}</b>\n"
+                f"🤖 AI: <b>{'вкл' if AI_ENABLED else 'выкл'}</b>"
+                + extra,
                 parse_mode=ParseMode.HTML,
             )
 
-            # Превью из 3 карточек
             await self.send_initial_preview(update, domain, items or [], limit=3)
 
-            # Отметим первичную отправку (для периодических оповещений)
             conn2 = sqlite3.connect(self.db_path, timeout=30)
             c2 = conn2.cursor()
             c2.execute(
@@ -231,21 +309,16 @@ class NewsMonitorBot:
         except Exception as e:
             logger.exception("Error adding source")
             await update.message.reply_text(
-                f"❌ Error adding source: {escape(str(e))}",
-                parse_mode=ParseMode.HTML,
+                f"❌ Ошибка: {escape(str(e))}", parse_mode=ParseMode.HTML
             )
 
     async def list_sources(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-
         cursor.execute(
-            """
-            SELECT domain, status, feed_type, last_check, created_at
-            FROM sources WHERE user_id = ?
-            ORDER BY created_at DESC
-            """,
+            "SELECT domain, status, feed_type, last_check, created_at "
+            "FROM sources WHERE user_id = ? ORDER BY created_at DESC",
             (user_id,),
         )
         rows = cursor.fetchall()
@@ -253,37 +326,31 @@ class NewsMonitorBot:
 
         if not rows:
             await update.message.reply_text(
-                "📭 No sources being monitored.\n\nUse /add <url> to start monitoring a website!",
+                "📭 Источников нет.\n\nДобавьте: /add &lt;url&gt;",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        message = "📊 <b>Your Monitored Sources:</b>\n\n"
-        for i, (domain, status, feed_type, last_check, created_at) in enumerate(rows, 1):
-            status_emoji = "🟢" if status == "active" else "🔴"
-            if not last_check:
-                last_check_str = "Never"
-            else:
-                try:
-                    last_check_dt = (
-                        datetime.fromisoformat(last_check)
-                        if isinstance(last_check, str)
-                        else last_check
-                    )
-                    last_check_str = last_check_dt.strftime("%m-%d %H:%M")
-                except Exception:
-                    last_check_str = str(last_check)
+        message = "📊 <b>Отслеживаемые источники:</b>\n\n"
+        for i, (domain, status, feed_type, last_check, _) in enumerate(rows, 1):
+            status_emoji = {"active": "🟢", "paused": "⏸"}.get(status, "🔴")
+            try:
+                lc = datetime.fromisoformat(last_check) if isinstance(last_check, str) else last_check
+                lc_str = lc.strftime("%m-%d %H:%M") if lc else "Никогда"
+            except Exception:
+                lc_str = str(last_check) if last_check else "Никогда"
 
-            message += f"{i}. {status_emoji} <b>{escape(domain)}</b>\n"
-            message += f"   📡 Type: {escape((feed_type or '').upper())}\n"
-            message += f"   🕒 Last check: {escape(last_check_str)}\n\n"
+            message += (
+                f"{i}. {status_emoji} <b>{escape(domain)}</b>\n"
+                f"   📡 {escape((feed_type or '').upper())} · 🕒 {escape(lc_str)}\n\n"
+            )
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
     async def remove_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text(
-                "Usage: /remove <domain>\n\nExample:\n/remove microsoft.com",
+                "Usage: /remove &lt;domain&gt;\nПример: /remove microsoft.com",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -291,20 +358,18 @@ class NewsMonitorBot:
         domain = context.args[0].lower()
         if domain.startswith("www."):
             domain = domain[4:]
-
         user_id = update.effective_user.id
+
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-
         cursor.execute(
-            "SELECT id FROM sources WHERE user_id = ? AND domain = ?",
-            (user_id, domain),
+            "SELECT id FROM sources WHERE user_id = ? AND domain = ?", (user_id, domain)
         )
         result = cursor.fetchone()
-
         if not result:
             await update.message.reply_text(
-                f"❌ Domain <code>{escape(domain)}</code> not found in your monitored sources.\n\nUse /list to see your sources.",
+                f"❌ Домен <code>{escape(domain)}</code> не найден. "
+                "Используйте /list для просмотра источников.",
                 parse_mode=ParseMode.HTML,
             )
             conn.close()
@@ -315,24 +380,207 @@ class NewsMonitorBot:
         cursor.execute("DELETE FROM sources WHERE id = ?", (source_id,))
         conn.commit()
         conn.close()
+        await update.message.reply_text(
+            f"✅ Удалён <code>{escape(domain)}</code>.", parse_mode=ParseMode.HTML
+        )
+
+    async def pause_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /pause &lt;domain&gt;", parse_mode=ParseMode.HTML
+            )
+            return
+        domain = context.args[0].lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        user_id = update.effective_user.id
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE sources SET status = 'paused' WHERE user_id = ? AND domain = ?",
+            (user_id, domain),
+        )
+        if cursor.rowcount == 0:
+            await update.message.reply_text(
+                f"❌ Домен <code>{escape(domain)}</code> не найден.", parse_mode=ParseMode.HTML
+            )
+        else:
+            conn.commit()
+            await update.message.reply_text(
+                f"⏸ Мониторинг <b>{escape(domain)}</b> приостановлен.\n"
+                "Возобновить: /resume " + escape(domain),
+                parse_mode=ParseMode.HTML,
+            )
+        conn.close()
+
+    async def resume_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /resume &lt;domain&gt;", parse_mode=ParseMode.HTML
+            )
+            return
+        domain = context.args[0].lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        user_id = update.effective_user.id
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE sources SET status = 'active' WHERE user_id = ? AND domain = ?",
+            (user_id, domain),
+        )
+        if cursor.rowcount == 0:
+            await update.message.reply_text(
+                f"❌ Домен <code>{escape(domain)}</code> не найден.", parse_mode=ParseMode.HTML
+            )
+        else:
+            conn.commit()
+            await update.message.reply_text(
+                f"▶️ Мониторинг <b>{escape(domain)}</b> возобновлён.", parse_mode=ParseMode.HTML
+            )
+        conn.close()
+
+    async def check_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ручная проверка всех источников пользователя."""
+        user_id = update.effective_user.id
+        await update.message.reply_text("🔄 Проверяю источники...", parse_mode=ParseMode.HTML)
+        count = await self._check_user_sources(context, user_id, force=True)
+        if count == 0:
+            await update.message.reply_text("✅ Новых материалов не найдено.", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(
+                f"✅ Готово. Найдено новых: <b>{count}</b>", parse_mode=ParseMode.HTML
+            )
+
+    async def search_items(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /search &lt;запрос&gt;\nПример: /search webinar",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        query = " ".join(context.args).lower()
+        user_id = update.effective_user.id
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT ic.title, ic.link, ic.pub_date, COALESCE(ic.category,'other'), s.domain
+            FROM item_cache ic
+            JOIN sources s ON s.id = ic.source_id
+            WHERE s.user_id = ? AND LOWER(ic.title) LIKE ?
+            ORDER BY ic.pub_date DESC
+            LIMIT 10
+            """,
+            (user_id, f"%{query}%"),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text(
+                f"🔍 Ничего не найдено по запросу «{escape(query)}».",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lines = [f"🔍 <b>Результаты поиска «{escape(query)}»:</b>\n"]
+        for title, link, pub_date, category, domain in rows:
+            try:
+                dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+                date_str = dt.strftime("%d.%m.%Y") if dt else ""
+            except Exception:
+                date_str = ""
+            emoji = CAT_EMOJI.get(category, "🏷️")
+            lines.append(
+                f"{emoji} <b>{escape(title or 'No title')}</b>\n"
+                f"   📅 {date_str} · {escape(domain)}\n"
+                f"   <a href=\"{escape(link or '', quote=True)}\">{escape(link or '')}</a>\n"
+            )
 
         await update.message.reply_text(
-            f"✅ Removed <code>{escape(domain)}</code> from monitoring.",
+            "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+
+    async def set_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /schedule HH:MM\nПример: /schedule 09:30",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            parts = context.args[0].split(":")
+            hh, mm = int(parts[0]), int(parts[1])
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+        except Exception:
+            await update.message.reply_text(
+                "❌ Неверный формат. Используйте HH:MM, например: /schedule 09:30",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        user_id = update.effective_user.id
+        self._ensure_user_settings(user_id)
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE user_settings SET schedule_hour = ?, schedule_minute = ? WHERE user_id = ?",
+            (hh, mm, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"⏰ Время уведомлений установлено: <b>{hh:02d}:{mm:02d}</b>",
             parse_mode=ParseMode.HTML,
         )
 
+    async def toggle_digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self._ensure_user_settings(user_id)
+        settings = self._get_user_settings(user_id)
+        new_mode = not settings["digest_mode"]
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE user_settings SET digest_mode = ? WHERE user_id = ?",
+            (new_mode, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+        if new_mode:
+            await update.message.reply_text(
+                "📋 <b>Режим дайджеста включён.</b>\n\n"
+                "Все новые статьи будут собраны в один ежедневный дайджест.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                "🔔 <b>Режим дайджеста выключен.</b>\n\n"
+                "Каждая новая статья будет приходить отдельным сообщением.",
+                parse_mode=ParseMode.HTML,
+            )
+
+    # ---------------------- Favourites ----------------------
+
     async def favourites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать избранные (если добавлялись внешне)."""
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT title, link, pub_date, COALESCE(category, 'other'), source_domain
-            FROM favourites
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 10
+            SELECT title, link, pub_date, COALESCE(category,'other'), source_domain, summary
+            FROM favourites WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT 10
             """,
             (user_id,),
         )
@@ -340,31 +588,91 @@ class NewsMonitorBot:
         conn.close()
 
         if not rows:
-            await update.message.reply_text("⭐️ Избранных пока нет.")
+            await update.message.reply_text(
+                "⭐️ Избранных пока нет.\n\nНажмите ⭐️ под любой статьёй, чтобы добавить."
+            )
             return
 
-        lines = ["⭐️ <b>Избранные материалы:</b>"]
-        for title, link, pub_date, category, domain in rows:
+        lines = ["⭐️ <b>Избранные материалы:</b>\n"]
+        for title, link, pub_date, category, domain, summary in rows:
             try:
-                dt = (
-                    datetime.fromisoformat(pub_date)
-                    if isinstance(pub_date, str)
-                    else pub_date
-                )
+                dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+                date_str = dt.strftime("%d.%m.%Y") if dt else ""
             except Exception:
-                dt = datetime.now()
-            date_str = dt.strftime("%b %d, %Y")
+                date_str = ""
+            emoji = CAT_EMOJI.get(category, "🏷️")
             lines.append(
-                f"<b>{escape(title or 'No title')}</b>\n"
-                f"📅 {escape(date_str)}\n"
-                f"🔗 <a href=\"{escape(link or '', quote=True)}\">{escape(link or '')}</a>\n"
+                f"{emoji} <b>{escape(title or 'No title')}</b>\n"
+                f"📅 {date_str} · {escape(domain or '')}\n"
+                f"<a href=\"{escape(link or '', quote=True)}\">{escape(link or '')}</a>"
             )
+            if summary:
+                lines.append(f"💬 <i>{escape(summary)}</i>")
+            lines.append("")
 
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
-    # --- Категории ---
+    async def save_favourite_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик кнопки ⭐️ В избранное."""
+        query = update.callback_query
+        await query.answer()
+
+        data = query.data
+        if not data.startswith("fav:"):
+            return
+        try:
+            item_cache_id = int(data.split(":", 1)[1])
+        except Exception:
+            return
+
+        user_id = query.from_user.id
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT ic.title, ic.link, ic.pub_date, ic.category, ic.summary, s.domain
+            FROM item_cache ic
+            JOIN sources s ON s.id = ic.source_id
+            WHERE ic.id = ? AND s.user_id = ?
+            """,
+            (item_cache_id, user_id),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return
+
+        title, link, pub_date, category, summary, domain = row
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO favourites "
+                "(user_id, title, link, pub_date, category, source_domain, summary) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, title, link, pub_date, category, domain, summary),
+            )
+            conn.commit()
+            saved = cursor.rowcount > 0
+        except Exception:
+            saved = False
+        conn.close()
+
+        if saved:
+            keyboard = [[InlineKeyboardButton("✅ Сохранено в избранном", callback_data="noop")]]
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Уже есть в избранном!", show_alert=False)
+
+    # ---------------------- Categories ----------------------
+
     async def event_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "event")
 
@@ -377,62 +685,72 @@ class NewsMonitorBot:
     async def other_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._send_category_list(update, "other")
 
-    async def _send_category_list(
-        self, update: Update, category: str, limit: int = 10
-    ):
-        """Берём элементы пользователя из кеша, классифицируем и отправляем выбранную категорию."""
-        from newsbot.classify import classify_news  # локальный импорт, чтобы избежать циклов
-
+    async def _send_category_list(self, update: Update, category: str, limit: int = 10):
         user_id = update.effective_user.id
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
+
+        # Сначала ищем по сохранённой категории
         cursor.execute(
             """
-            SELECT ic.title, ic.link, ic.pub_date
+            SELECT ic.title, ic.link, ic.pub_date, ic.category
             FROM item_cache ic
             JOIN sources s ON s.id = ic.source_id
-            WHERE s.user_id = ?
-            ORDER BY ic.pub_date DESC
-            LIMIT 300
+            WHERE s.user_id = ? AND ic.category = ?
+            ORDER BY ic.pub_date DESC LIMIT ?
             """,
-            (user_id,),
+            (user_id, category, limit),
         )
         rows = cursor.fetchall()
-        conn.close()
 
-        items: List[Dict] = []
-        for title, link, pub_date in rows:
-            try:
+        if not rows:
+            # Фоллбэк: классифицируем на лету для старых записей без категории
+            cursor.execute(
+                """
+                SELECT ic.title, ic.link, ic.pub_date
+                FROM item_cache ic
+                JOIN sources s ON s.id = ic.source_id
+                WHERE s.user_id = ?
+                ORDER BY ic.pub_date DESC LIMIT 300
+                """,
+                (user_id,),
+            )
+            all_rows = cursor.fetchall()
+            conn.close()
+
+            items: List[Dict] = []
+            for title, link, pub_date in all_rows:
                 cat = classify_news(title or "", link or "")
                 if cat == category:
-                    dt = (
-                        datetime.fromisoformat(pub_date)
-                        if isinstance(pub_date, str)
-                        else pub_date
-                    )
-                    items.append({
-                        "title": title,
-                        "link": link,
-                        "date": dt,
-                        "category": cat,
-                    })
-            except Exception:
-                continue
+                    try:
+                        dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+                    except Exception:
+                        dt = datetime.now()
+                    items.append({"title": title, "link": link, "date": dt, "category": cat})
+        else:
+            conn.close()
+            items = []
+            for title, link, pub_date, cat in rows:
+                try:
+                    dt = datetime.fromisoformat(pub_date) if isinstance(pub_date, str) else pub_date
+                except Exception:
+                    dt = datetime.now()
+                items.append({"title": title, "link": link, "date": dt, "category": cat or category})
 
         if not items:
-            await update.message.reply_text("Ничего не найдено в этой категории пока.")
+            await update.message.reply_text("Ничего не найдено в этой категории.")
             return
 
         items.sort(key=lambda x: x["date"], reverse=True)
         items = items[:limit]
 
         title_map = {
-            "event": "Новости про ивенты",
-            "product": "Новости про продукты",
-            "cases": "Новости про кейсы",
-            "other": "Другие новости",
+            "event": "Ивенты",
+            "product": "Продукты",
+            "cases": "Кейсы",
+            "other": "Другое",
         }
-        lines = [f"<b>{escape(title_map.get(category, 'Новости'))}</b>"]
+        lines = [f"<b>{escape(title_map.get(category, 'Новости'))}</b>\n"]
         for it in items:
             lines.append(_format_compact_line(it))
 
@@ -440,18 +758,14 @@ class NewsMonitorBot:
             "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
-    # ------------------ Initial preview ------------------
+    # ---------------------- Initial preview ----------------------
+
     async def send_initial_preview(
-        self,
-        update: Update,
-        domain: str,
-        items: List[Dict],
-        limit: int = 3,
+        self, update: Update, domain: str, items: List[Dict], limit: int = 3
     ):
-        """Отправляем превью из N карточек (кеш уже заполнен ранее)."""
         if not items:
             await update.message.reply_text(
-                f"📭 No recent items found for {escape(domain)}",
+                f"📭 Свежих материалов для {escape(domain)} не найдено.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -460,163 +774,265 @@ class NewsMonitorBot:
         preview = items_sorted[:limit]
 
         await update.message.reply_text(
-            f"📰 <b>Latest {len(preview)} items from {escape(domain)}:</b>\n<i>Found {len(items_sorted)} total articles</i>",
+            f"📰 <b>Последние материалы {escape(domain)}</b>: {len(preview)} из {len(items_sorted)}",
             parse_mode=ParseMode.HTML,
         )
 
         for i, item in enumerate(preview, 1):
-            message = f"<b>{i}/{len(preview)}</b>\n{format_news_item(item)}"
+            msg = f"<b>{i}/{len(preview)}</b>\n{format_news_item(item)}"
             await update.message.reply_text(
-                message, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True
             )
             await asyncio.sleep(0.25)
 
-    # ------------------ Scheduler job ------------------
-    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
-        """Ежедневная проверка всех источников (по расписанию)."""
-        logger.info("Starting scheduled check for all sources...")
+    # ---------------------- Scheduler ----------------------
 
+    async def periodic_check(self, context: ContextTypes.DEFAULT_TYPE):
+        """Запускается каждые 5 минут. Отправляет уведомления пользователям по их расписанию."""
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
-
         cursor.execute(
-            """
-            SELECT id, user_id, domain, feed_url, feed_type
-            FROM sources
-            WHERE status = 'active' AND first_sent = TRUE
-            """
+            "SELECT DISTINCT user_id FROM sources WHERE status = 'active' AND first_sent = TRUE"
+        )
+        user_ids = [r[0] for r in cursor.fetchall()]
+        conn.close()
+
+        for user_id in user_ids:
+            settings = self._get_user_settings(user_id)
+            try:
+                tz = ZoneInfo(settings["schedule_tz"])
+                now_local = datetime.now(tz)
+            except Exception:
+                now_local = datetime.now()
+
+            sched_h = settings["schedule_hour"]
+            sched_m = settings["schedule_minute"]
+            today_str = now_local.strftime("%Y-%m-%d")
+
+            if (
+                now_local.hour == sched_h
+                and now_local.minute == sched_m
+                and settings["last_digest_date"] != today_str
+            ):
+                logger.info(f"Scheduled check for user {user_id}")
+                await self._check_user_sources(context, user_id)
+
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE user_settings SET last_digest_date = ? WHERE user_id = ?",
+                    (today_str, user_id),
+                )
+                conn.commit()
+                conn.close()
+
+    async def _check_user_sources(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, force: bool = False
+    ) -> int:
+        """
+        Проверяет источники пользователя и отправляет новые материалы.
+        Возвращает количество найденных новых статей.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, domain, feed_url, feed_type FROM sources "
+            "WHERE user_id = ? AND status = 'active' AND first_sent = TRUE",
+            (user_id,),
         )
         sources = cursor.fetchall()
-        logger.info(f"Checking {len(sources)} active sources...")
 
-        for source_id, user_id, domain, feed_url, feed_type in sources:
+        settings = self._get_user_settings(user_id)
+        digest_mode = settings["digest_mode"]
+
+        all_new_by_source: Dict[str, List[Dict]] = {}
+        total_new = 0
+
+        for source_id, domain, feed_url, feed_type in sources:
             try:
                 items = await fetch_items(feed_url, feed_type)
                 if not items:
                     continue
 
-                # сравнение по item_id
                 cursor.execute(
                     "SELECT item_id FROM item_cache WHERE source_id = ?", (source_id,)
                 )
                 cached_ids = {row[0] for row in cursor.fetchall()}
+                new_items = [it for it in items if it["id"] not in cached_ids]
 
-                new_items = [item for item in items if item["id"] not in cached_ids]
+                if not new_items:
+                    cursor.execute(
+                        "UPDATE sources SET last_check = ? WHERE id = ?",
+                        (datetime.now(), source_id),
+                    )
+                    conn.commit()
+                    continue
 
-                if new_items:
-                    logger.info(f"Found {len(new_items)} new items for {domain}")
-                    new_items.sort(key=lambda x: x["date"])  # отправим по возрастанию
-                    for item in new_items:
+                logger.info(f"{len(new_items)} new items for {domain} (user {user_id})")
+                new_items.sort(key=lambda x: x["date"])
+                total_new += len(new_items)
+
+                domain_new: List[Dict] = []
+                for item in new_items:
+                    cat, summary = await self._classify_item(item)
+                    item["category"] = cat
+                    item["summary"] = summary
+                    item["_domain"] = domain
+
+                    try:
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO item_cache "
+                            "(source_id, item_id, title, link, pub_date, category, summary) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (source_id, item["id"], item.get("title"),
+                             item.get("link"), item.get("date"), cat, summary),
+                        )
+                        item["_cache_id"] = cursor.lastrowid
+                    except Exception:
+                        item["_cache_id"] = None
+
+                    domain_new.append(item)
+                    await asyncio.sleep(0.1)
+
+                conn.commit()
+
+                if not digest_mode:
+                    for item in domain_new:
                         await self._notify_new_item(context, user_id, item)
-
-                        # Сохраняем в кеш
-                        try:
-                            cursor.execute(
-                                """
-                                INSERT OR IGNORE INTO item_cache (source_id, item_id, title, link, pub_date)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    source_id,
-                                    item["id"],
-                                    item.get("title"),
-                                    item.get("link"),
-                                    item.get("date"),
-                                ),
-                            )
-                        except Exception:
-                            continue
                         await asyncio.sleep(0.4)
+                else:
+                    all_new_by_source[domain] = domain_new
 
-                # Обновляем last_check
                 cursor.execute(
                     "UPDATE sources SET last_check = ? WHERE id = ?",
                     (datetime.now(), source_id),
                 )
+                conn.commit()
 
             except Exception as e:
                 logger.error(f"Error checking source {domain}: {e}")
 
-        conn.commit()
         conn.close()
-        logger.info("Scheduled check completed.")
+
+        if digest_mode and all_new_by_source:
+            digest_text = format_digest(all_new_by_source)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=digest_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send digest to {user_id}: {e}")
+
+        return total_new
 
     async def _notify_new_item(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int, item: Dict
     ):
-        """Уведомление о новой статье (HTML)."""
+        """Уведомление о новой статье с кнопкой ⭐️."""
         cat = (item.get("category") or "other").lower()
         dt = item.get("date") or datetime.now()
         try:
-            date_str = (
-                dt.strftime("%b %d, %Y %H:%M") if isinstance(dt, datetime) else str(dt)
-            )
+            date_str = dt.strftime("%d %b %Y %H:%M") if isinstance(dt, datetime) else str(dt)
         except Exception:
             date_str = str(dt)
 
-        title_html = escape(item.get("title", "No title"))
-        link = item.get("link", "")
-        link_html = escape(link, quote=True)
+        title_html = escape(item.get("title") or "No title")
+        link = item.get("link") or ""
+        summary = item.get("summary") or ""
+        domain = item.get("_domain") or ""
 
         msg = (
-            "Я нашёл новую статью для тебя:\n\n"
             f"📰 <b>{title_html}</b>\n"
             f"📅 {escape(date_str)}\n"
-            f"🏷️ {escape(CAT_RU.get(cat, 'другое'))} ({escape(cat)})\n"
-            f"🔗 <a href=\"{link_html}\">{escape(link)}</a>"
+            f"🏷️ {escape(CAT_RU.get(cat, 'другое'))}\n"
+            f"🌐 {escape(domain)}\n"
+            f"🔗 <a href=\"{escape(link, quote=True)}\">{escape(link)}</a>"
         )
+        if summary:
+            msg += f"\n\n💬 <i>{escape(summary)}</i>"
+
+        keyboard = []
+        cache_id = item.get("_cache_id")
+        if cache_id:
+            keyboard.append([
+                InlineKeyboardButton("⭐️ В избранное", callback_data=f"fav:{cache_id}")
+            ])
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
         await context.bot.send_message(
             chat_id=user_id,
             text=msg,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=reply_markup,
         )
 
-    # ------------------ Menu (set /commands) ------------------
+    # ---------------------- Menu ----------------------
+
     async def _post_init(self, app: Application):
-        """Обновляем список команд в меню Telegram."""
         commands = [
-            BotCommand("start", "Запустить бота"),
-            BotCommand("list", "Список доменов"),
-            BotCommand("add", "Добавить: /add url"),
-            BotCommand("remove", "Удалить: /remove domain"),
-            BotCommand("favourites", "Показать избранные"),
-            BotCommand("event", "Новости про ивенты"),
-            BotCommand("product", "Новости про продукты"),
-            BotCommand("cases", "Новости про кейсы"),
-            BotCommand("other", "Другие новости"),
+            BotCommand("start",      "Запустить / справка"),
+            BotCommand("add",        "Добавить источник: /add url"),
+            BotCommand("remove",     "Удалить: /remove domain"),
+            BotCommand("pause",      "Приостановить: /pause domain"),
+            BotCommand("resume",     "Возобновить: /resume domain"),
+            BotCommand("list",       "Список источников"),
+            BotCommand("check",      "Проверить прямо сейчас"),
+            BotCommand("search",     "Поиск: /search запрос"),
+            BotCommand("favourites", "Избранное"),
+            BotCommand("event",      "Ивенты"),
+            BotCommand("product",    "Продукты"),
+            BotCommand("cases",      "Кейсы"),
+            BotCommand("other",      "Другое"),
+            BotCommand("schedule",   "Расписание: /schedule HH:MM"),
+            BotCommand("digest",     "Режим дайджеста вкл/выкл"),
         ]
         await app.bot.set_my_commands(commands)
         logger.info("Commands set")
 
-    # ------------------ Runner ------------------
+    # ---------------------- Runner ----------------------
+
     def run(self):
         app = (
             Application.builder()
             .token(self.token)
-            .post_init(self._post_init)   # PTB 21.6: задаём post_init в builder
+            .post_init(self._post_init)
             .build()
         )
 
-        # Команды
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("add", self.add_source))
-        app.add_handler(CommandHandler("list", self.list_sources))
-        app.add_handler(CommandHandler("remove", self.remove_source))
+        app.add_handler(CommandHandler("start",      self.start))
+        app.add_handler(CommandHandler("add",        self.add_source))
+        app.add_handler(CommandHandler("list",       self.list_sources))
+        app.add_handler(CommandHandler("remove",     self.remove_source))
+        app.add_handler(CommandHandler("pause",      self.pause_source))
+        app.add_handler(CommandHandler("resume",     self.resume_source))
+        app.add_handler(CommandHandler("check",      self.check_now))
+        app.add_handler(CommandHandler("search",     self.search_items))
+        app.add_handler(CommandHandler("schedule",   self.set_schedule))
+        app.add_handler(CommandHandler("digest",     self.toggle_digest))
         app.add_handler(CommandHandler("favourites", self.favourites))
-        app.add_handler(CommandHandler("event", self.event_cmd))
-        app.add_handler(CommandHandler("product", self.product_cmd))
-        app.add_handler(CommandHandler("cases", self.cases_cmd))
-        app.add_handler(CommandHandler("other", self.other_cmd))
+        app.add_handler(CommandHandler("event",      self.event_cmd))
+        app.add_handler(CommandHandler("product",    self.product_cmd))
+        app.add_handler(CommandHandler("cases",      self.cases_cmd))
+        app.add_handler(CommandHandler("other",      self.other_cmd))
 
-        # Ежедневное расписание (job-queue)
+        app.add_handler(CallbackQueryHandler(self.save_favourite_callback, pattern=r"^fav:"))
+        app.add_handler(CallbackQueryHandler(
+            lambda u, c: u.callback_query.answer(), pattern=r"^noop$"
+        ))
+
+        # Проверка каждые 5 минут (вместо одного раза в день)
         try:
-            tz = ZoneInfo(SCHEDULE_TZ)
-            t = dtime(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, tzinfo=tz)
-            app.job_queue.run_daily(self.periodic_check, time=t, name="daily-check")
-            logger.info(
-                f"Scheduler set for {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}"
+            app.job_queue.run_repeating(
+                self.periodic_check,
+                interval=300,
+                first=10,
+                name="periodic-check",
             )
+            logger.info("Periodic check scheduled every 5 minutes")
         except Exception as e:
             logger.warning(f"Scheduler init skipped: {e}")
 

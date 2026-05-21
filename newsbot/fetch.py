@@ -1,18 +1,32 @@
 # newsbot/fetch.py
-
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+from .config import DOMAIN_RULES, DEFAULT_ALLOWED, DEFAULT_BANNED, BYPASS_FILTER_DOMAINS
+
+logger = logging.getLogger(__name__)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (news-monitor-bot)"}
 TIMEOUT = 15
 
+try:
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 
 # ------------------- URL Normalization -------------------
+
 def normalize_url(url: str):
     """
     Нормализует URL и возвращает (normalized_base_url, domain).
@@ -20,96 +34,169 @@ def normalize_url(url: str):
     """
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-
     if domain.startswith("www."):
         domain = domain[4:]
-
     normalized = f"{parsed.scheme}://{parsed.netloc}"
     return normalized, domain
 
 
+# ------------------- Path filtering -------------------
+
+def _is_allowed_path(link: str, domain: str) -> bool:
+    """Проверяет, разрешён ли путь URL по правилам домена."""
+    if domain in BYPASS_FILTER_DOMAINS:
+        return True
+
+    path = urlparse(link).path.lower()
+    rules = DOMAIN_RULES.get(domain)
+
+    if rules:
+        allowed = rules.get("allow", ())
+        banned = rules.get("ban", ())
+    else:
+        allowed = DEFAULT_ALLOWED
+        banned = DEFAULT_BANNED
+
+    for ban in banned:
+        if path.startswith(ban):
+            return False
+
+    if allowed:
+        return any(path.startswith(a) for a in allowed)
+
+    return True
+
+
+# ------------------- HTTP with retry -------------------
+
+def _get_with_retry(url: str, retries: int = 3) -> requests.Response:
+    """GET-запрос с экспоненциальным retry (без tenacity для простоты)."""
+    import time
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_exc
+
+
+# ------------------- Playwright fetch -------------------
+
+async def _fetch_html_playwright(url: str) -> str | None:
+    """Загружает страницу через headless Chromium (для JS-сайтов)."""
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+            await page.goto(url, timeout=30_000, wait_until="networkidle")
+            html = await page.content()
+            await browser.close()
+            return html
+    except Exception as e:
+        logger.debug(f"Playwright fetch failed for {url}: {e}")
+        return None
+
+
 # ------------------- Feed discovery -------------------
+
 async def discover_feed(url: str):
     """
-    Пытаемся определить тип источника.
-    1) Если по URL доступен RSS/Atom — вернём (url, 'rss'/'atom').
-    2) Иначе попробуем типовые страницы новостей: /news, /press, /press-center, /media, /novosti.
-       - если там есть RSS/Atom — вернём их;
-       - иначе вернём (страницу, 'html'), чтобы работал HTML-парсер.
-    3) Если ничего не найдено — вернём (url, 'html') как фоллбек.
+    Определяет тип источника. Приоритет:
+    1) LinkedIn → ('linkedin')
+    2) Прямой RSS/Atom по переданному URL
+    3) RSS/Atom на типовых путях (/blog, /news, /press ...)
+    4) HTML на типовых путях (предпочтительнее корня сайта)
+    5) Фоллбэк → корень сайта как HTML
     """
-    # Сначала пробуем как RSS/Atom напрямую
+    parsed_url = urlparse(url)
+
+    # LinkedIn
+    if "linkedin.com" in parsed_url.netloc:
+        return url, "linkedin"
+
+    COMMON_PATHS = [
+        "news", "blog", "press", "press-center", "presscentre",
+        "media", "novosti", "newsroom", "articles", "updates",
+    ]
+
+    base = url if url.endswith("/") else url + "/"
+
+    # Шаг 1: прямой RSS/Atom по переданному URL
     try:
         parsed = feedparser.parse(url)
         if parsed.bozo == 0 and parsed.entries:
-            # Простая эвристика: если в корне есть <rss> — 'rss', иначе 'atom'
-            # (feedparser сам нормализует, но нам тип не критичен)
             return url, "rss"
     except Exception:
         pass
 
-    # Если не получилось — проверим саму страницу плюс типовые пути
-    COMMON_PATHS = ["news", "press", "press-center", "presscentre", "media", "novosti"]
-
-    def _check_candidate(candidate_url: str):
-        # Сначала пробуем как RSS/Atom
-        try:
-            p = feedparser.parse(candidate_url)
-            if p.bozo == 0 and p.entries:
-                return candidate_url, "rss"
-        except Exception:
-            pass
-
-        # Иначе просто проверим, что HTML страница открывается
-        try:
-            r = requests.get(candidate_url, headers=HEADERS, timeout=TIMEOUT)
-            if r.ok:
-                return candidate_url, "html"
-        except Exception:
-            pass
-        return None
-
-    # Проверим исходный URL как HTML
-    base_res = _check_candidate(url)
-    if base_res:
-        return base_res
-
-    # Перебираем типовые подстраницы
-    base = url if url.endswith("/") else url + "/"
+    # Шаг 2: RSS/Atom на типовых путях
     for path in COMMON_PATHS:
         candidate = urljoin(base, path)
-        res = _check_candidate(candidate)
-        if res:
-            return res
+        try:
+            p = feedparser.parse(candidate)
+            if p.bozo == 0 and p.entries:
+                return candidate, "rss"
+        except Exception:
+            pass
 
-    # Фоллбек — хотя бы html по исходному адресу
+    # Шаг 3: HTML на типовых путях (блог/пресс лучше главной страницы)
+    for path in COMMON_PATHS:
+        candidate = urljoin(base, path)
+        try:
+            r = _get_with_retry(candidate)
+            if r.ok:
+                return candidate, "html"
+        except Exception:
+            pass
+
+    # Шаг 4: фоллбэк — корень как HTML
     return url, "html"
 
 
+# ------------------- Title cleanup -------------------
+
+_TITLE_STRIP_PREFIXES = ("blog", "news", "press", "article", "post", "read more", "learn more")
+_TITLE_STRIP_SUFFIXES = ("learn more", "read more", "read article", "view more", "→", "»")
+
+def _clean_title(text: str) -> str:
+    """Убирает навигационный мусор из заголовков (Blog, Learn More и т.п.)"""
+    t = text.strip()
+    low = t.lower()
+    for prefix in _TITLE_STRIP_PREFIXES:
+        if low.startswith(prefix) and len(t) > len(prefix) + 2:
+            t = t[len(prefix):].lstrip(" :-–—|/")
+            low = t.lower()
+    for suffix in _TITLE_STRIP_SUFFIXES:
+        if low.endswith(suffix):
+            t = t[: -len(suffix)].rstrip(" :-–—|/")
+            low = t.lower()
+    return t.strip()
+
+
 # ------------------- HTML parser -------------------
-def _extract_articles_generic(html: str, base_url: str):
+
+def _extract_articles_generic(html: str, base_url: str, domain: str = ""):
     """
-    Универсальный HTML-парсер новостей для корпоративных сайтов.
-    Ищет статьи по типичным селекторам и пытается извлечь title/link/date.
+    Универсальный HTML-парсер для корпоративных сайтов.
+    Применяет фильтрацию путей по DOMAIN_RULES.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # кандидаты для поиска новостей
     candidates = []
-    # 1) семантические теги
     candidates += soup.select("article")
-    # 2) часто встречающиеся классы
     candidates += soup.select("[class*=news], [class*=post], [class*=card], [class*=item]")
-    # 3) списки с ссылками
     candidates += soup.select("ul li a, .cards a, .list a, .news-list a")
 
     seen = set()
     items = []
     for node in candidates:
-        # нормализуем к ссылке
         a = node if node.name == "a" else node.find("a", href=True)
         if not a or not a.get("href"):
             continue
@@ -117,14 +204,18 @@ def _extract_articles_generic(html: str, base_url: str):
         link = urljoin(base_url, a.get("href"))
         if link in seen:
             continue
+
+        # Фильтрация по разрешённым/запрещённым путям
+        if domain and not _is_allowed_path(link, domain):
+            continue
+
         seen.add(link)
 
-        # заголовок
-        title = (a.get_text(strip=True) or node.get_text(strip=True))[:300]
+        raw_title = (a.get_text(strip=True) or node.get_text(strip=True))[:300]
+        title = _clean_title(raw_title)
         if not title:
             continue
 
-        # дата (если есть <time> или дата в data-* атрибуте)
         dt = None
         time_tag = node.find("time")
         if time_tag:
@@ -136,39 +227,86 @@ def _extract_articles_generic(html: str, base_url: str):
                     dt = None
 
         if dt is None:
-            # Fallback: без даты считаем сейчас — чтобы не терять элемент
-            dt = datetime.now()
+            dt = datetime(2000, 1, 1)  # фоллбэк — уйдёт вниз при сортировке
 
-        items.append(
-            {
-                "id": link,
-                "title": title,
-                "link": link,
-                "date": dt,
-                "category": "other",
-            }
-        )
+        items.append({
+            "id": link,
+            "title": title,
+            "link": link,
+            "date": dt,
+            "category": "other",
+        })
 
         if len(items) >= 30:
             break
 
+    # Помечаем элементы без реальной даты
+    for it in items:
+        if it.get("_date_fallback"):
+            pass
+        it["_date_fallback"] = True  # все HTML-даты — фоллбэк, уточним ниже
+
     return items
 
 
+def _fetch_jsonld_date(url: str) -> datetime | None:
+    """Синхронно получает дату публикации из JSON-LD на странице статьи."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                for key in ("datePublished", "dateCreated", "uploadDate"):
+                    val = data.get(key)
+                    if val:
+                        return datetime.fromisoformat(
+                            val.replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+async def _enrich_dates(items: list[dict], limit: int = 30):
+    """Параллельно подтягивает реальные даты для HTML-статей (до limit штук)."""
+    to_enrich = [it for it in items if it.get("_date_fallback")][:limit]
+    if not to_enrich:
+        return
+
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=limit) as pool:
+        futures = [
+            loop.run_in_executor(pool, _fetch_jsonld_date, it["link"])
+            for it in to_enrich
+        ]
+        results = await asyncio.gather(*futures, return_exceptions=True)
+
+    for it, dt in zip(to_enrich, results):
+        if isinstance(dt, datetime):
+            it["date"] = dt
+        it.pop("_date_fallback", None)
+
+
 # ------------------- Fetch items -------------------
+
 async def fetch_items(url: str, feed_type: str):
     """
-    Загружаем список новостей:
-    - RSS/Atom через feedparser (по URL)
-    - HTML fallback через requests + BeautifulSoup
-    Возвращаем список словарей: {id,title,link,date,category}
+    Загружает список новостей.
+    Поддерживает: rss/atom, html (с Playwright-фоллбэком), linkedin.
+    Возвращает список {id, title, link, date, category}.
     """
+    if feed_type == "linkedin":
+        from .linkedin import fetch_linkedin_posts
+        return await fetch_linkedin_posts(url)
+
     if feed_type in ("rss", "atom"):
         parsed = feedparser.parse(url)
         items = []
         for entry in parsed.entries:
             try:
-                # дата публикации: пытаемся аккуратно извлечь
                 dt = None
                 if getattr(entry, "published_parsed", None):
                     try:
@@ -183,20 +321,34 @@ async def fetch_items(url: str, feed_type: str):
                 if dt is None:
                     dt = datetime.now()
 
-                items.append(
-                    {
-                        "id": entry.get("id") or entry.get("link"),
-                        "title": entry.get("title"),
-                        "link": entry.get("link"),
-                        "date": dt,
-                        "category": "other",
-                    }
-                )
+                items.append({
+                    "id": entry.get("id") or entry.get("link"),
+                    "title": entry.get("title"),
+                    "link": entry.get("link"),
+                    "date": dt,
+                    "category": "other",
+                })
             except Exception:
                 continue
         return items
 
     # HTML fallback
-    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return _extract_articles_generic(resp.text, url)
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    html = None
+    try:
+        resp = _get_with_retry(url)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        logger.warning(f"HTTP fetch failed for {url}: {e} — trying Playwright...")
+        html = await _fetch_html_playwright(url)
+        if not html:
+            raise
+
+    items = _extract_articles_generic(html, url, domain)
+    await _enrich_dates(items)
+    return items
