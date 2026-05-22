@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from dateutil import parser as date_parser
 
 from .config import DOMAIN_RULES, DEFAULT_ALLOWED, DEFAULT_BANNED, BYPASS_FILTER_DOMAINS
 
@@ -160,14 +162,45 @@ async def discover_feed(url: str):
     return url, "html"
 
 
-# ------------------- Title cleanup -------------------
+# ------------------- Title & date extraction -------------------
 
 _TITLE_STRIP_PREFIXES = ("blog", "news", "press", "article", "post", "read more", "learn more")
 _TITLE_STRIP_SUFFIXES = ("learn more", "read more", "read article", "view more", "→", "»")
 
+# Паттерн для дат в тексте: "April 1st, 2026" / "March 26th, 2026" / "2026-04-01"
+_DATE_IN_TEXT = re.compile(
+    r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+    r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b'
+    r'|\b\d{4}-\d{2}-\d{2}\b'
+    r'|\b\d{1,2}[./]\d{1,2}[./]\d{4}\b',
+    re.IGNORECASE,
+)
+
+# Паттерн для удаления ALL-CAPS категорий из начала: "PRODUCT UPDATES", "AI & AUTOMATION"
+_ALLCAPS_PREFIX = re.compile(r'^[A-Z][A-Z &]+(?:\s+[A-Z][A-Z &]+)*\s*')
+
+
+def _extract_date_from_text(text: str) -> datetime | None:
+    """Ищет дату в произвольном тексте."""
+    match = _DATE_IN_TEXT.search(text)
+    if match:
+        try:
+            return date_parser.parse(match.group(), ignoretz=True)
+        except Exception:
+            pass
+    return None
+
+
 def _clean_title(text: str) -> str:
-    """Убирает навигационный мусор из заголовков (Blog, Learn More и т.п.)"""
+    """Убирает навигационный мусор, даты и ALL-CAPS категории из заголовков."""
     t = text.strip()
+
+    # Удаляем даты из текста
+    t = _DATE_IN_TEXT.sub("", t).strip(" ,-–—")
+
+    # Удаляем ALL-CAPS категории в начале ("PRODUCT UPDATES", "AI & AUTOMATION")
+    t = _ALLCAPS_PREFIX.sub("", t).strip()
+
     low = t.lower()
     for prefix in _TITLE_STRIP_PREFIXES:
         if low.startswith(prefix) and len(t) > len(prefix) + 2:
@@ -201,7 +234,7 @@ def _extract_articles_generic(html: str, base_url: str, domain: str = ""):
         if not a or not a.get("href"):
             continue
 
-        link = urljoin(base_url, a.get("href"))
+        link = urljoin(base_url, a.get("href")).rstrip("/")
         if link in seen:
             continue
 
@@ -211,11 +244,22 @@ def _extract_articles_generic(html: str, base_url: str, domain: str = ""):
 
         seen.add(link)
 
-        raw_title = (a.get_text(strip=True) or node.get_text(strip=True))[:300]
+        # Заголовок: ищем h1-h4, потом img alt, потом текст ссылки
+        heading = node.find(["h1", "h2", "h3", "h4"])
+        img_tag = a.find("img")
+        if heading:
+            raw_title = heading.get_text(strip=True)
+        elif img_tag and img_tag.get("alt"):
+            raw_title = img_tag["alt"]
+        else:
+            raw_title = a.get_text(strip=True) or node.get_text(strip=True)
+        raw_title = raw_title[:300]
+
         title = _clean_title(raw_title)
         if not title:
             continue
 
+        # Дата: <time datetime=...> → текст <time> → текст карточки → фоллбэк
         dt = None
         time_tag = node.find("time")
         if time_tag:
@@ -224,7 +268,12 @@ def _extract_articles_generic(html: str, base_url: str, domain: str = ""):
                 try:
                     dt = datetime.fromisoformat(date_text.replace("Z", "+00:00"))
                 except Exception:
-                    dt = None
+                    dt = _extract_date_from_text(date_text)
+
+        if dt is None:
+            # Ищем дату в тексте всей карточки (например "March 26th, 2026")
+            card_text = node.get_text(" ", strip=True)
+            dt = _extract_date_from_text(card_text)
 
         if dt is None:
             dt = datetime(2000, 1, 1)  # фоллбэк — уйдёт вниз при сортировке
@@ -240,11 +289,23 @@ def _extract_articles_generic(html: str, base_url: str, domain: str = ""):
         if len(items) >= 30:
             break
 
-    # Помечаем элементы без реальной даты
+    # Дедупликация по заголовку: оставляем URL с наибольшей глубиной пути
+    title_index: dict[str, int] = {}
+    deduped = []
     for it in items:
-        if it.get("_date_fallback"):
-            pass
-        it["_date_fallback"] = True  # все HTML-даты — фоллбэк, уточним ниже
+        key = it["title"].lower()
+        if key not in title_index:
+            title_index[key] = len(deduped)
+            deduped.append(it)
+        else:
+            existing = deduped[title_index[key]]
+            if len(it["link"]) > len(existing["link"]):
+                deduped[title_index[key]] = it
+    items = deduped
+
+    # Помечаем элементы без реальной даты для последующего обогащения
+    for it in items:
+        it["_date_fallback"] = it["date"] == datetime(2000, 1, 1)
 
     return items
 

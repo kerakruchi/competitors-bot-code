@@ -448,11 +448,65 @@ class NewsMonitorBot:
         await update.message.reply_text("🔄 Проверяю источники...", parse_mode=ParseMode.HTML)
         count = await self._check_user_sources(context, user_id, force=True)
         if count == 0:
-            await update.message.reply_text("✅ Новых материалов не найдено.", parse_mode=ParseMode.HTML)
+            await self._send_recent_digest(context, user_id, update)
         else:
             await update.message.reply_text(
                 f"✅ Готово. Найдено новых: <b>{count}</b>", parse_mode=ParseMode.HTML
             )
+
+    async def _send_recent_digest(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        update=None,
+    ):
+        """Отправляет дайджест из кеша за последние 7 дней если новых статей нет."""
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT s.domain, ic.title, ic.link, ic.pub_date, ic.category "
+            "FROM item_cache ic "
+            "JOIN sources s ON ic.source_id = s.id "
+            "WHERE s.user_id = ? AND ic.pub_date >= date('now', '-7 days') "
+            "ORDER BY ic.pub_date DESC LIMIT 30",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            msg = "✅ Новых материалов нет. Кеш за последние 7 дней пуст."
+            if update:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
+            return
+
+        from collections import defaultdict
+        by_domain: dict = defaultdict(list)
+        for domain, title, link, pub_date, category in rows:
+            by_domain[domain].append((title, link, pub_date, category))
+
+        CAT_EMOJI = {"event": "🎪", "product": "🧩", "cases": "📘", "other": "🏷️"}
+        lines = ["📰 <b>Последние статьи за 7 дней:</b>\n"]
+        for domain, articles in by_domain.items():
+            lines.append(f"<b>{escape(domain)}</b>")
+            for title, link, pub_date, category in articles[:5]:
+                emoji = CAT_EMOJI.get(category or "other", "🏷️")
+                date_str = pub_date[:10] if pub_date else ""
+                lines.append(f"  {emoji} <a href=\"{link}\">{escape(title)}</a> <i>{date_str}</i>")
+            if len(articles) > 5:
+                lines.append(f"  <i>...и ещё {len(articles) - 5}</i>")
+            lines.append("")
+
+        text = "\n".join(lines).strip()
+        try:
+            if update:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Failed to send recent digest to {user_id}: {e}")
 
     async def search_items(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
@@ -531,7 +585,7 @@ class NewsMonitorBot:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE user_settings SET schedule_hour = ?, schedule_minute = ? WHERE user_id = ?",
+            "UPDATE user_settings SET schedule_hour = ?, schedule_minute = ?, last_digest_date = NULL WHERE user_id = ?",
             (hh, mm, user_id),
         )
         conn.commit()
@@ -809,13 +863,16 @@ class NewsMonitorBot:
             sched_m = settings["schedule_minute"]
             today_str = now_local.strftime("%Y-%m-%d")
 
-            if (
-                now_local.hour == sched_h
-                and now_local.minute == sched_m
-                and settings["last_digest_date"] != today_str
-            ):
+            now_min = now_local.hour * 60 + now_local.minute
+            sched_min = sched_h * 60 + sched_m
+            diff = (now_min - sched_min) % (24 * 60)
+
+            if diff < 5 and settings["last_digest_date"] != today_str:
                 logger.info(f"Scheduled check for user {user_id}")
-                await self._check_user_sources(context, user_id)
+                count = await self._check_user_sources(context, user_id)
+
+                if count == 0:
+                    await self._send_recent_digest(context, user_id)
 
                 conn = sqlite3.connect(self.db_path, timeout=30)
                 c = conn.cursor()

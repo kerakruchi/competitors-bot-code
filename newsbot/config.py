@@ -6,7 +6,7 @@ DB_PATH = os.getenv("DB_PATH", "news_monitor.db")
 
 # ====== Schedule (12:00 Europe/Moscow по умолчанию) ======
 SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/Moscow")
-SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "12"))
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "6"))
 SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 
 # ====== HTTP headers ======

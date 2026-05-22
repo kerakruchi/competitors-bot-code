@@ -21,3 +21,6 @@ venv/
 
 # Local data
 news_monitor.db
+
+# Environment variables (never commit tokens)
+.env
